@@ -1,0 +1,27 @@
+[theme]
+base = "dark"
+primaryColor = "#7C83FF"
+backgroundColor = "#0B0E14"
+secondaryBackgroundColor = "#141924"
+textColor = "#E6E9F0"
+borderColor = "#252C3B"
+linkColor = "#9EA4FF"
+baseRadius = "0.6rem"
+buttonRadius = "0.55rem"
+showWidgetBorder = true
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap, sans-serif"
+headingFontWeights = [700, 650, 600, 600, 600, 600]
+
+[theme.sidebar]
+backgroundColor = "#0F131B"
+secondaryBackgroundColor = "#161C28"
+
+[server]
+# Allow long meeting recordings (in MB).
+maxUploadSize = 1024
+# Don't watch thousands of library files (torch/transformers) — on Windows this can fail
+# with "WinError 1450 Insufficient system resources". Project source files are still watched.
+folderWatchBlacklist = [".venv", "venv", "vector_db", "data", "downloads", "downloades", "tests"]
+
+[browser]
+gatherUsageStats = false

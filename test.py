@@ -1,54 +1,47 @@
-from dotenv import load_dotenv
-load_dotenv()   # MUST be before any core/ imports
+"""Manual end-to-end smoke test against the REAL services (Whisper/Sarvam + Gemini).
 
-from utils.audio_processor import process_input
-from core.transcriber import transcribe_all
-from core.summarizer import summarize, generate_title
-from core.extractor import extract_action_items, extract_key_decisions, extract_questions
+This is not part of the automated test suite (that lives in ``tests/`` and runs
+offline with ``python -m pytest``). Running this script makes real API calls.
 
+Usage (PowerShell):
+    python test.py "https://youtu.be/<id>" english
+    python test.py "C:\\path\\to\\clip.mp3" hinglish
+"""
 
-source = "https://www.youtube.com/watch?v=_Q-e_nczWqM&t=223s"
-language = "english"   # "english" → Whisper, "hinglish" → Sarvam
+from __future__ import annotations
 
+import sys
 
+from core.config import load_environment
 
-chunks = process_input(source)
+load_environment()
 
-
-transcript = transcribe_all(chunks, language=language)
-print("\n" + "=" * 60)
-print("📝 TRANSCRIPT")
-print("=" * 60)
-print(transcript[:500] + "..." if len(transcript) > 500 else transcript)
+from main import print_progress  # noqa: E402
+from core.pipeline import PipelineError, run_pipeline  # noqa: E402
 
 
-title = generate_title(transcript)
-summary = summarize(transcript)
+def run(source: str, language: str) -> int:
+    try:
+        record = run_pipeline(source, language, progress=print_progress)
+    except PipelineError as exc:
+        print(f"\nFAILED at '{exc.stage_label}': {exc}")
+        return 1
 
-print("\n" + "=" * 60)
-print(f"📌 TITLE: {title}")
-print("=" * 60)
-print("\n📋 SUMMARY")
-print("-" * 60)
-print(summary)
+    transcript = record.transcript
+    print("\nTRANSCRIPT (first 500 chars):\n", transcript[:500] + ("…" if len(transcript) > 500 else ""))
+    for heading, content in [
+        ("TITLE", record.title),
+        ("SUMMARY", record.summary),
+        ("ACTION ITEMS", record.action_items),
+        ("KEY DECISIONS", record.key_decisions),
+        ("OPEN QUESTIONS", record.open_questions),
+    ]:
+        print(f"\n{'=' * 60}\n{heading}\n{'=' * 60}\n{content}")
+    return 0
 
 
-
-action_items = extract_action_items(transcript)
-decisions = extract_key_decisions(transcript)
-questions = extract_questions(transcript)
-
-print("\n" + "=" * 60)
-print("✅ ACTION ITEMS")
-print("=" * 60)
-print(action_items)
-
-print("\n" + "=" * 60)
-print("🔑 KEY DECISIONS")
-print("=" * 60)
-print(decisions)
-
-print("\n" + "=" * 60)
-print("❓ OPEN QUESTIONS")
-print("=" * 60)
-print(questions)
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(2)
+    sys.exit(run(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "english"))
