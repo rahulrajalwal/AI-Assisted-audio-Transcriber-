@@ -15,7 +15,7 @@ APP = str(Path(__file__).resolve().parent.parent / "app.py")
 
 
 @pytest.fixture
-def app(fake_api_key, monkeypatch) -> AppTest:
+def app(llm_ready, monkeypatch) -> AppTest:
     import core.vector_store
 
     monkeypatch.setattr(core.vector_store, "warm_up_embeddings", lambda: None)
@@ -50,13 +50,21 @@ def test_upload_required(app):
     assert any("upload an audio or video file" in e.value for e in at.error)
 
 
-def test_missing_gemini_key_blocks_processing(app, monkeypatch):
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+def test_openrouter_unreachable_blocks_processing(app, llm_down):
     at = app.run()
     at.text_input(key="youtube_url").set_value("https://youtu.be/abc")
     button(at, "Analyse meeting").click().run()
-    assert any("GOOGLE_API_KEY" in e.value for e in at.error)
+    assert any("Could not reach OpenRouter" in e.value for e in at.error)
+    assert at.session_state["job"] is None
+
+
+def test_sidebar_shows_openrouter_provider(app, llm_ready):
+    at = app.run()
+    sidebar_html = " ".join(m.value for m in at.sidebar.markdown)
+    assert "OpenRouter" in sidebar_html and "openai/gpt-4o-mini" in sidebar_html
+    assert "n/a (paid model)" in sidebar_html
+    assert "inactive (Gemini, Mistral preserved)" in sidebar_html
+    assert "Ollama" not in sidebar_html and "Qwen" not in sidebar_html
 
 
 def test_history_and_meeting_tabs(app):
@@ -69,24 +77,34 @@ def test_history_and_meeting_tabs(app):
     assert any("Weekly Product Sync" in m.value for m in at.markdown)
     assert [m.label for m in at.metric][:2] == ["Duration", "Words"]
 
-    for tab in ("Transcript", "Summary", "Action Items", "Key Decisions", "Open Questions"):
+    for tab in ("Ask Your Meeting", "Transcript", "Summary", "Action Items", "Key Decisions",
+                "Open Questions", "Downloads"):
         at.session_state["meeting_tab"] = tab
         at.run()
         assert not at.exception, tab
+    labels = [b.label for b in at.get("download_button")]
+    for expected in ("Download full report", "Download everything", "Download transcript", "Download summary",
+                     "Download action items", "Download key decisions", "Download open questions", "Download q&a chat"):
+        assert expected in labels, expected
 
 
-def test_chat_uses_rag_chain(app, monkeypatch):
-    save_meeting(make_record(title="Weekly Product Sync"))
-    seen = {}
-
-    def fake_ask(chain, question, history=None):
-        seen["question"], seen["history"] = question, list(history or [])
-        return {"answer": "Priya prepares the press kit [Source 1].", "sources": [
-            {"number": 1, "title": "Weekly Product Sync", "chunk_index": 0, "excerpt": "Priya will prepare the press kit", "meeting_id": "x"}
+def _fake_stream(seen):
+    def fake_stream(question, **kwargs):
+        seen["question"], seen["kwargs"] = question, kwargs
+        info = {"scope_note": "", "sources": [
+            {"number": 1, "title": "Weekly Product Sync", "chunk_index": 0, "start_seconds": 65.0, "end_seconds": 90.0,
+             "excerpt": "Priya will prepare the press kit", "meeting_id": "x", "meeting_date": "2026-11-05"}
         ]}
+        return info, iter(["Priya prepares ", "the press kit ", "[Source 1]."])
 
-    monkeypatch.setattr(core.rag_engine, "ask_question", fake_ask)
-    monkeypatch.setattr(core.rag_engine, "load_rag_chain", lambda meeting_id=None, persist_directory=None: object())
+    return fake_stream
+
+
+def test_chat_streams_answer_and_saves_history(app, monkeypatch):
+    record = make_record(title="Weekly Product Sync")
+    save_meeting(record)
+    seen = {}
+    monkeypatch.setattr(core.rag_engine, "stream_answer", _fake_stream(seen))
 
     at = app.run()
     button(at, "Open").click().run()
@@ -95,7 +113,24 @@ def test_chat_uses_rag_chain(app, monkeypatch):
     at.chat_input[0].set_value("Who prepares the press kit?").run()
     assert not at.exception
     assert seen["question"] == "Who prepares the press kit?"
-    chats = at.session_state["chats"]
-    history = next(iter(chats.values()))
-    assert history[-1]["content"].startswith("Priya")
-    assert history[-1]["sources"][0]["title"] == "Weekly Product Sync"
+    assert seen["kwargs"]["meeting_id"] == record.meeting_id  # "This meeting" scope
+    history = at.session_state["chats"][record.meeting_id]["This meeting"]
+    assert history[-1]["content"] == "Priya prepares the press kit [Source 1]."
+    assert history[-1]["sources"][0]["start_seconds"] == 65.0
+
+    from core.meeting_store import load_chats
+
+    assert load_chats(record.meeting_id)["This meeting"][-1]["content"].startswith("Priya")  # survives restarts
+
+
+def test_suggested_question_button_asks(app, monkeypatch):
+    record = make_record(title="Weekly Product Sync")
+    save_meeting(record)
+    seen = {}
+    monkeypatch.setattr(core.rag_engine, "stream_answer", _fake_stream(seen))
+    at = app.run()
+    button(at, "Open").click().run()
+    button(at, "What were the main topics discussed?").click().run()
+    assert not at.exception
+    assert seen["question"] == "What were the main topics discussed?"
+    assert at.session_state["meeting_tab"] == "Ask Your Meeting"

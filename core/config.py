@@ -30,6 +30,19 @@ def load_environment() -> None:
         _env_loaded = True
 
 
+def reload_environment() -> bool:
+    """Re-read ``.env`` so edits (e.g. a new OPENROUTER_MODEL) apply without restarting the app.
+
+    Values in ``.env`` replace the ones loaded earlier. Returns False if there is no ``.env``.
+    """
+    global _env_loaded
+    if not ENV_FILE.exists():
+        return False
+    load_dotenv(ENV_FILE, override=True)
+    _env_loaded = True
+    return True
+
+
 def _path_from_env(var_name: str, default: Path) -> Path:
     value = os.getenv(var_name, "").strip()
     path = Path(value) if value else default

@@ -10,11 +10,12 @@ import os
 import re
 import shutil
 import uuid
+from datetime import date
 from pathlib import Path
 
 import streamlit as st
 
-from core.config import load_environment, work_dir
+from core.config import load_environment, reload_environment, work_dir
 
 load_environment()  # must happen before modules that read configuration are used
 
@@ -26,8 +27,8 @@ st.set_page_config(
 )
 
 from core.extractor import count_items  # noqa: E402
-from core.llm import LLMError, get_model_name, is_llm_configured  # noqa: E402
-from core.meeting_store import MeetingRecord, list_meetings, load_meeting  # noqa: E402
+from core.llm import LLMError, check_openrouter, get_model_name, get_provider_label  # noqa: E402
+from core.meeting_store import MeetingRecord, list_meetings, load_chats, load_meeting, save_chats  # noqa: E402
 from core.pipeline import (  # noqa: E402
     STAGE_LABELS,
     STAGES,
@@ -36,7 +37,7 @@ from core.pipeline import (  # noqa: E402
     analyse_transcript,
     run_pipeline,
 )
-from core.rag_engine import ask_question, load_rag_chain  # noqa: E402
+from core.rag_engine import format_timestamp, stream_answer  # noqa: E402
 from core.transcriber import LANGUAGE_ENGINES, get_whisper_model_name  # noqa: E402
 from core.vector_store import warm_up_embeddings  # noqa: E402
 from utils.audio_processor import (  # noqa: E402
@@ -47,9 +48,12 @@ from utils.audio_processor import (  # noqa: E402
 )
 from utils.exporter import (  # noqa: E402
     build_pdf_report,
+    chat_to_txt,
+    export_bundle,
     format_date,
     safe_filename,
-    summary_to_txt,
+    section_to_txt,
+    timestamped_paragraphs,
     transcript_to_txt,
 )
 
@@ -105,19 +109,64 @@ st.markdown(
 .ok {color: #2BB673;} .bad {color: #FF6B6B;} .muted {color: #7D8496;}
 [data-testid="stSidebar"] .stButton button {justify-content: flex-start; text-align: left;}
 [data-testid="stSidebar"] .stButton button p {white-space: nowrap; overflow: hidden; text-overflow: ellipsis;}
+
+/* ── v2 polish ── */
+.hero h1 {background: linear-gradient(90deg, #FFFFFF 0%, #C9CCFF 55%, #7FE3D7 100%); -webkit-background-clip: text;
+          background-clip: text; -webkit-text-fill-color: transparent;}
+.hero-pills {display: flex; flex-wrap: wrap; gap: .45rem; margin-top: 1.1rem;}
+.hero-pills span {font-size: .8rem; color: #C3C8D6; background: rgba(255,255,255,.04); border: 1px solid #2A3244;
+                  padding: .3rem .7rem; border-radius: 999px;}
+.stepper {border: 1px solid #252C3B; background: #11161F; border-radius: 14px; padding: 1.1rem 1.2rem;}
+.stepper-title {font-weight: 650; font-size: 1.05rem; margin-bottom: .7rem;}
+.step {display: flex; gap: .7rem; align-items: center; padding: .42rem 0; color: #C9CEDA; font-size: .9rem;}
+.step .num {width: 1.6rem; height: 1.6rem; border-radius: 8px; flex-shrink: 0; display: flex; align-items: center;
+            justify-content: center; font-weight: 700; font-size: .78rem; color: #0B0E14;
+            background: linear-gradient(135deg, #7C83FF, #4FD1C5);}
+.stepper-foot {color: #7D8496; font-size: .78rem; margin-top: .6rem;}
+.feature {transition: border-color .15s, transform .15s;}
+.feature:hover {border-color: #3B4560; transform: translateY(-2px);}
+[data-testid="stMetric"] {background: #11161F;}
+/* tabs as pills */
+[data-testid="stTabs"] [role="tablist"] {gap: .4rem; flex-wrap: wrap; padding-bottom: .5rem;}
+[data-testid="stTab"] {background: #121722; border: 1px solid #222938 !important; border-radius: 999px;
+                       padding: .32rem 1rem !important; height: auto; transition: border-color .15s, background .15s;}
+[data-testid="stTab"]:hover {border-color: #3B4560 !important;}
+[data-testid="stTab"][aria-selected="true"] {background: rgba(124,131,255,.18); border-color: rgba(124,131,255,.6) !important;}
+[data-testid="stTab"][aria-selected="true"] p {color: #DADCFF; font-weight: 600;}
+/* transcript with timestamps */
+.tline {display: flex; gap: .85rem; align-items: flex-start; padding: .35rem 0; border-bottom: 1px dashed #1E2533;}
+.tline:last-child {border-bottom: none;}
+.tline p {margin: 0;}
+.ts {flex-shrink: 0; font-family: ui-monospace, Consolas, monospace; font-size: .76rem; color: #A9AEFF;
+     background: rgba(124,131,255,.1); border: 1px solid rgba(124,131,255,.28); border-radius: 6px;
+     padding: .08rem .45rem; margin-top: .25rem;}
+/* chat */
+[data-testid="stChatMessage"] {border-radius: 14px; padding: .75rem .9rem; margin-bottom: .5rem;
+                               border: 1px solid #1F2633; background: #10151E;}
+[data-testid="stChatMessage"]:has(.u-msg) {background: rgba(124,131,255,.09); border-color: rgba(124,131,255,.3);
+                                           width: 86%; margin-left: auto; box-sizing: border-box;}
+.u-msg {display: none;}
+.srcs {display: flex; flex-wrap: wrap; gap: .35rem; margin: .45rem 0 .1rem;}
+.src {font-size: .74rem; color: #8FE3D9; background: rgba(79,209,197,.08); border: 1px solid rgba(79,209,197,.28);
+      border-radius: 999px; padding: .1rem .55rem;}
+.chat-empty {text-align: center; padding: 3.2rem 1.5rem; color: #C9CEDA; line-height: 1.6;}
+.chat-empty .big {font-size: 2.4rem; margin-bottom: .4rem;}
+.chat-empty .muted {max-width: 520px; margin: .4rem auto 0; font-size: .9rem;}
 </style>
 """,
     unsafe_allow_html=True,
 )
 
+CHAT_TAB = "Ask Your Meeting"
 TAB_NAMES = [
     "Overview",
+    CHAT_TAB,
     "Transcript",
     "Summary",
     "Action Items",
     "Key Decisions",
     "Open Questions",
-    "Ask Your Meeting",
+    "Downloads",
 ]
 SCOPE_THIS, SCOPE_ALL = "This meeting", "All meetings"
 SUGGESTED_QUESTIONS = [
@@ -184,6 +233,22 @@ def summary_section(summary: str, heading: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def llm_status() -> dict:
+    """OpenRouter key / model / free-quota status (cached; uses no model requests)."""
+    status = check_openrouter()
+    return {
+        "key_configured": status.key_configured,
+        "key_valid": status.key_valid,
+        "model_available": status.model_available,
+        "daily_used": status.daily_used,
+        "daily_limit": status.daily_limit,
+        "daily_remaining": status.daily_remaining,
+        "ready": status.ready,
+        "error": status.error,
+    }
+
+
 def sarvam_configured() -> bool:
     return bool((os.getenv("SARVAM_API_KEY") or "").strip())
 
@@ -195,7 +260,7 @@ def init_state() -> None:
     defaults = {
         "view": "home",  # "home" | "meeting"
         "meeting_id": None,
-        "chats": {},  # "<meeting_id>|<scope>" -> list of messages
+        "chats": {},  # meeting_id -> {scope: [messages]} (also saved to disk)
         "job": None,  # pending processing job (runs on the next script run)
         "failure": None,  # last pipeline failure (with transcript, when available)
     }
@@ -220,18 +285,6 @@ def start_background_warmup() -> bool:
     """Once per server process: preload the embedding model so indexing/chat start fast."""
     warm_up_embeddings()
     return True
-
-
-@st.cache_resource(show_spinner=False)
-def get_rag_chain(meeting_id: str | None):
-    """RAG chains hold no per-user state (history is passed per call), so they are shared."""
-    return load_rag_chain(meeting_id=meeting_id)
-
-
-@st.cache_data(show_spinner=False, max_entries=20)
-def pdf_report_bytes(meeting_id: str, processed_at: str) -> bytes:
-    record = load_meeting(meeting_id)
-    return build_pdf_report(record) if record else b""
 
 
 # ── Progress UI (driven by real pipeline events) ────────────────────────────────
@@ -297,7 +350,7 @@ def render_sidebar(meetings: list[MeetingRecord], busy: bool) -> None:
     with st.sidebar:
         st.markdown(
             '<div class="brand"><div class="logo">🎙️</div><div><div class="name">AI Meeting Assistant</div>'
-            f'<div class="tag">Powered by {esc(get_model_name())}</div></div></div>',
+            f'<div class="tag">OpenRouter · {esc(get_model_name())}</div></div></div>',
             unsafe_allow_html=True,
         )
         st.button("＋  New meeting", width="stretch", type="primary", on_click=go_home, disabled=busy)
@@ -319,9 +372,12 @@ def render_sidebar(meetings: list[MeetingRecord], busy: bool) -> None:
                 disabled=busy,
             )
 
-        st.markdown('<div class="section-title">System status</div>', unsafe_allow_html=True)
+        status_box = st.expander("System status", icon=":material/monitor_heart:")
+        llm = llm_status()
         rows = [
-            ("Gemini API key", is_llm_configured(), "configured", "missing"),
+            ("OpenRouter API key", llm["key_configured"] and llm["key_valid"],
+             "valid", "missing" if not llm["key_configured"] else "not verified"),
+            ("LLM model", llm["model_available"], "available", "unavailable"),
             ("Sarvam API key", sarvam_configured(), "configured", "missing"),
             ("FFmpeg", bool(shutil.which("ffmpeg")), "found", "not found"),
         ]
@@ -330,20 +386,42 @@ def render_sidebar(meetings: list[MeetingRecord], busy: bool) -> None:
             f'<span class="{"ok" if ok else "bad"}">{"✓ " + good if ok else "✕ " + bad}</span></div>'
             for name, ok, good, bad in rows
         )
-        html_rows += (
-            f'<div class="status-row"><span>LLM</span><span class="muted">{esc(get_model_name())}</span></div>'
+        if not get_model_name().endswith(":free"):
+            quota = "n/a (paid model)"
+        elif llm["daily_remaining"] is not None and llm["daily_limit"] is not None:
+            quota = f"{llm['daily_remaining']} of {llm['daily_limit']} left"
+        else:
+            quota = "—"
+        html_rows = (
+            f'<div class="status-row"><span>Provider</span><span class="muted">{esc(get_provider_label())}</span></div>'
+            f'<div class="status-row"><span>Model</span><span class="muted">{esc(get_model_name())}</span></div>'
+            + html_rows
+            + f'<div class="status-row"><span>Free requests today</span><span class="muted">{esc(quota)}</span></div>'
             f'<div class="status-row"><span>Whisper model</span><span class="muted">{esc(get_whisper_model_name())}</span></div>'
+            '<div class="status-row"><span>Legacy LLMs</span><span class="muted">inactive (Gemini, Mistral preserved)</span></div>'
         )
-        st.markdown(html_rows, unsafe_allow_html=True)
+        if llm["error"]:
+            st.warning(llm["error"], icon=":material/warning:")
+        status_box.markdown(html_rows, unsafe_allow_html=True)
+        if status_box.button("Refresh status", icon=":material/refresh:", width="stretch", disabled=busy,
+                     help="Re-reads .env (e.g. a changed OPENROUTER_MODEL) and re-checks OpenRouter."):
+            reload_environment()
+            llm_status.clear()
+            st.rerun()
 
 
 # ── Home ────────────────────────────────────────────────────────────────────────
 
 
-def queue_job_from_form(source_mode: str, url: str, upload, language: str, force: bool) -> str | None:
+def queue_job_from_form(
+    source_mode: str, url: str, upload, language: str, force: bool, meeting_date: date | None = None
+) -> str | None:
     """Validate inputs and queue a processing job. Returns an error message or None."""
-    if not is_llm_configured():
-        return "Gemini API key not found. Add GOOGLE_API_KEY to the .env file and restart the app."
+    reload_environment()  # pick up .env edits (model, keys) without restarting the app
+    llm_status.clear()
+    status = llm_status()
+    if not status["ready"]:
+        return status["error"] or "The local LLM is not ready."
     if language == "hinglish" and not sarvam_configured():
         return "SARVAM_API_KEY is not set in .env — it is required for Hinglish transcription."
     if not shutil.which("ffmpeg"):
@@ -354,7 +432,7 @@ def queue_job_from_form(source_mode: str, url: str, upload, language: str, force
             source = validate_youtube_url(url)
         except AudioProcessingError as exc:
             return str(exc)
-        job = {"kind": "full", "source": source, "label": source, "upload_dir": None}
+        job = {"kind": "full", "source": source, "label": source, "source_type": "youtube", "upload_dir": None}
     else:
         if upload is None:
             return "Please upload an audio or video file."
@@ -366,9 +444,15 @@ def queue_job_from_form(source_mode: str, url: str, upload, language: str, force
         saved = upload_dir / f"input{suffix}"
         with open(saved, "wb") as handle:
             shutil.copyfileobj(upload, handle)
-        job = {"kind": "full", "source": str(saved), "label": upload.name, "upload_dir": str(upload_dir)}
+        job = {
+            "kind": "full",
+            "source": str(saved),
+            "label": upload.name,
+            "source_type": "upload",
+            "upload_dir": str(upload_dir),
+        }
 
-    job.update(language=language, force=force)
+    job.update(language=language, force=force, meeting_date=(meeting_date or date.today()).isoformat())
     st.session_state.job = job
     st.session_state.failure = None
     return None
@@ -378,10 +462,12 @@ def render_hero() -> None:
     st.markdown(
         f"""
 <div class="hero">
-  <span class="eyebrow">✦ {esc(get_model_name())} · Whisper · Sarvam AI</span>
+  <span class="eyebrow">✦ {esc(get_model_name())} via OpenRouter · Whisper · Sarvam AI</span>
   <h1>Turn every meeting into clear decisions</h1>
-  <p>Drop in a recording or a YouTube link. Get a faithful transcript, a structured summary,
-  action items, decisions and open questions — then ask follow-up questions grounded in what was actually said.</p>
+  <p>Drop in a recording or a YouTube link. Get a timestamped transcript, a structured summary,
+  action items, decisions and open questions — then chat with the meeting and get answers grounded in what was actually said.</p>
+  <div class="hero-pills"><span>🎧 Upload or YouTube</span><span>📝 Timestamped transcript</span>
+  <span>✅ Actions &amp; decisions</span><span>💬 Chat with sources</span><span>⬇ PDF · TXT · ZIP</span></div>
 </div>""",
         unsafe_allow_html=True,
     )
@@ -425,15 +511,23 @@ def render_input_card(busy: bool) -> None:
             disabled=busy,
         )
         with st.expander("Advanced options"):
+            meeting_date = st.date_input(
+                "Meeting date",
+                value=date.today(),
+                key="meeting_date",
+                disabled=busy,
+                help="Used for history and questions like 'what did we decide last week?'.",
+            )
             force = st.checkbox(
-                "Re-run Gemini analysis even if this meeting was analysed before",
+                "Re-run the AI analysis even if this meeting was analysed before",
                 key="force_reanalyse",
                 disabled=busy,
-                help="By default a previously analysed meeting reuses its saved results (no extra Gemini calls).",
+                help="By default a previously analysed meeting reuses its saved results (no extra LLM calls). "
+                "Re-running also refreshes this meeting's stored transcript chunks.",
             )
 
         if st.button("Analyse meeting", type="primary", icon=":material/auto_awesome:", disabled=busy):
-            error = queue_job_from_form(source_mode, url, upload, language, force)
+            error = queue_job_from_form(source_mode, url, upload, language, force, meeting_date)
             if error:
                 st.error(error, icon=":material/error:")
             else:
@@ -444,7 +538,7 @@ def render_features() -> None:
     features = [
         ("🎧", "Any source", "YouTube links or local audio and video files, converted to clean 16 kHz audio."),
         ("🗣️", "English & Hinglish", "Whisper runs locally for English; Sarvam AI handles Hinglish speech."),
-        ("✨", "Gemini analysis", "Map-Reduce summaries plus action items, decisions and open questions."),
+        ("✨", "AI analysis", f"{get_model_name()} via OpenRouter: Map-Reduce summaries, actions, decisions, open questions."),
         ("💬", "Ask your meetings", "Grounded answers with sources from one meeting or your whole history."),
     ]
     columns = st.columns(len(features))
@@ -486,7 +580,7 @@ def render_failure(busy: bool) -> None:
     st.error(f"**Processing failed during: {failure['stage']}**\n\n{failure['message']}", icon=":material/error:")
     if failure.get("transcript"):
         st.info(
-            "Transcription finished successfully, so you can retry the Gemini analysis without "
+            "Transcription finished successfully, so you can retry the AI analysis without "
             "transcribing the audio again.",
             icon=":material/info:",
         )
@@ -498,6 +592,9 @@ def render_failure(busy: bool) -> None:
                 "label": failure["source"],
                 "language": failure["language"],
                 "duration": failure.get("duration"),
+                "segments": failure.get("segments") or [],
+                "source_type": failure.get("source_type", ""),
+                "meeting_date": failure.get("meeting_date", ""),
                 "force": False,
                 "upload_dir": None,
             }
@@ -529,14 +626,23 @@ def run_job(container) -> None:
             record = analyse_transcript(
                 job["transcript"],
                 source=job["label"],
+                source_type=job.get("source_type", ""),
                 language=job["language"],
                 duration_seconds=job.get("duration"),
+                segments=job.get("segments"),
+                meeting_date=job.get("meeting_date", ""),
                 progress=tracker,
                 force=job["force"],
             )
         else:
             record = run_pipeline(
-                job["source"], job["language"], progress=tracker, source_label=job["label"], force=job["force"]
+                job["source"],
+                job["language"],
+                progress=tracker,
+                source_label=job["label"],
+                source_type=job.get("source_type", ""),
+                meeting_date=job.get("meeting_date", ""),
+                force=job["force"],
             )
     except PipelineError as exc:
         status.update(label=f"Failed: {exc.stage_label}", state="error", expanded=True)
@@ -547,6 +653,9 @@ def run_job(container) -> None:
             "source": job["label"],
             "language": job["language"],
             "duration": exc.duration_seconds or job.get("duration"),
+            "segments": exc.segments or job.get("segments") or [],
+            "source_type": job.get("source_type", ""),
+            "meeting_date": job.get("meeting_date", ""),
         }
         st.session_state.job = None
     except Exception as exc:  # last-resort boundary: never show a success state after a failure
@@ -577,11 +686,15 @@ def render_home(meetings: list[MeetingRecord], busy: bool) -> None:
         with progress_area:
             render_failure(busy)
     with right:
-        with st.container(border=True):
-            st.markdown("#### How it works")
-            for number, stage in enumerate(STAGES, start=1):
-                st.markdown(f"**{number}.** {stage.label}")
-            st.caption("Progress for each stage is reported live while your meeting is processed.")
+        steps = "".join(
+            f'<div class="step"><div class="num">{number}</div><div>{esc(stage.label)}</div></div>'
+            for number, stage in enumerate(STAGES, start=1)
+        )
+        st.markdown(
+            f'<div class="stepper"><div class="stepper-title">How it works</div>{steps}'
+            '<div class="stepper-foot">Live progress for every stage · then chat with the transcript</div></div>',
+            unsafe_allow_html=True,
+        )
     st.markdown('<div class="section-title">What you get</div>', unsafe_allow_html=True)
     render_features()
     render_recent(meetings, busy)
@@ -593,9 +706,36 @@ def render_home(meetings: list[MeetingRecord], busy: bool) -> None:
 # ── Meeting view ────────────────────────────────────────────────────────────────
 
 
+def meeting_chats(meeting_id: str) -> dict[str, list[dict]]:
+    """This meeting's conversations (loaded from disk once per session)."""
+    chats = st.session_state.chats
+    if meeting_id not in chats:
+        chats[meeting_id] = load_chats(meeting_id)
+    return chats[meeting_id]
+
+
+def persist_chats(meeting_id: str) -> None:
+    try:
+        save_chats(meeting_id, meeting_chats(meeting_id))
+    except OSError:
+        pass  # saving history is best-effort; the conversation stays in the session
+
+
+def all_messages(meeting_id: str) -> list[dict]:
+    """Both scopes' conversations, in order, for exports."""
+    chats = meeting_chats(meeting_id)
+    return chats.get(SCOPE_THIS, []) + chats.get(SCOPE_ALL, [])
+
+
+def ask_from_button(question: str) -> None:
+    """Callback for suggestion buttons: queue the question and jump to the chat tab."""
+    st.session_state["pending_question"] = question
+    st.session_state["meeting_tab"] = CHAT_TAB
+
+
 def render_meeting_header(record: MeetingRecord) -> None:
     chips = [
-        f"📅 {format_date(record.processed_at)}",
+        f"📅 {record.meeting_date or format_date(record.processed_at)}",
         f"⏱ {format_duration(record.duration_seconds)}",
         f"🗣 {engine_label(record.language)}",
         f"✦ {record.model or get_model_name()}",
@@ -611,7 +751,7 @@ def render_meeting_header(record: MeetingRecord) -> None:
     )
 
 
-def render_metrics_and_exports(record: MeetingRecord) -> None:
+def render_metrics_and_actions(record: MeetingRecord) -> None:
     metrics = st.columns(5)
     metrics[0].metric("Duration", format_duration(record.duration_seconds), border=True)
     metrics[1].metric("Words", f"{len(record.transcript.split()):,}", border=True)
@@ -619,30 +759,20 @@ def render_metrics_and_exports(record: MeetingRecord) -> None:
     metrics[3].metric("Decisions", count_items(record.key_decisions), border=True)
     metrics[4].metric("Open questions", count_items(record.open_questions), border=True)
 
-    exports = st.columns([1, 1, 1, 2])
-    exports[0].download_button(
-        "Transcript (TXT)",
-        data=transcript_to_txt(record),
-        file_name=safe_filename(record.title, "transcript.txt"),
-        mime="text/plain",
-        icon=":material/description:",
-        width="stretch",
+    actions = st.columns([1.2, 1, 1, 2.2])
+    actions[0].button(
+        "Ask AI about this meeting", type="primary", icon=":material/forum:", width="stretch",
+        on_click=lambda: st.session_state.update(meeting_tab=CHAT_TAB),
     )
-    exports[1].download_button(
-        "Summary (TXT)",
-        data=summary_to_txt(record),
-        file_name=safe_filename(record.title, "summary.txt"),
-        mime="text/plain",
-        icon=":material/summarize:",
-        width="stretch",
+    actions[1].download_button(
+        "PDF report", data=lambda: build_pdf_report(record, chat=all_messages(record.meeting_id)),
+        file_name=safe_filename(record.title, "report.pdf"), mime="application/pdf",
+        icon=":material/picture_as_pdf:", width="stretch",
     )
-    exports[2].download_button(
-        "Report (PDF)",
-        data=lambda: pdf_report_bytes(record.meeting_id, record.processed_at),
-        file_name=safe_filename(record.title, "report.pdf"),
-        mime="application/pdf",
-        icon=":material/picture_as_pdf:",
-        width="stretch",
+    actions[2].download_button(
+        "Everything (ZIP)", data=lambda: export_bundle(record, all_messages(record.meeting_id)),
+        file_name=safe_filename(record.title, "meeting.zip"), mime="application/zip",
+        icon=":material/folder_zip:", width="stretch",
     )
 
 
@@ -659,6 +789,29 @@ def render_preview(column, title: str, content: str, empty_text: str) -> None:
             st.caption(f"+{len(items) - 3} more in the {title} tab")
 
 
+def suggested_questions(record: MeetingRecord) -> list[str]:
+    """Generic starters plus questions built from this meeting's own extractions."""
+    questions = list(SUGGESTED_QUESTIONS)
+
+    def first_title(markdown_list: str) -> str:
+        items = split_items(markdown_list)
+        if not items:
+            return ""
+        title = re.sub(r"^\d+\.\s*", "", items[0].splitlines()[0])
+        return re.sub(r"\*\*|—.*$", "", title).strip().rstrip(".")[:80]
+
+    decision = first_title(record.key_decisions)
+    action = first_title(record.action_items)
+    question = first_title(record.open_questions)
+    if decision:
+        questions.insert(0, f"Why was this decided: {decision}?")
+    if action:
+        questions.insert(1, f"Give me more detail on: {action}")
+    if question:
+        questions.insert(2, f"What was said about: {question}?")
+    return questions[:7]
+
+
 def render_overview(record: MeetingRecord) -> None:
     left, right = st.columns([3, 2], gap="large")
     with left:
@@ -670,144 +823,241 @@ def render_overview(record: MeetingRecord) -> None:
             if topics:
                 st.markdown("**Main topics**")
                 names = re.findall(r"^\s*[-*]\s*\*\*(.+?)\*\*", topics, flags=re.M)
-                st.markdown("\n".join(f"- {name}" for name in names) if names else topics)
+                st.markdown("\n".join(f"- {name.rstrip(':')}" for name in names) if names else topics)
     with right:
         with st.container(border=True):
-            st.markdown("#### Details")
-            details = [
-                ("Processed", format_date(record.processed_at)),
-                ("Duration", format_duration(record.duration_seconds)),
-                ("Language", engine_label(record.language)),
-                ("Model", record.model or get_model_name()),
-                ("Source", record.source or "—"),
-                ("Meeting ID", record.meeting_id),
-            ]
-            for label, value in details:
-                st.markdown(f"**{label}:** {escape_md(value)}")
+            st.markdown("#### 💬 Ask about this meeting")
+            st.caption("Answers come only from the transcript, with timestamped sources.")
+            for index, question in enumerate(suggested_questions(record)[:4]):
+                st.button(
+                    question, key=f"ov_q_{index}", width="stretch", icon=":material/chat_bubble:",
+                    on_click=ask_from_button, args=(question,),
+                )
     c1, c2, c3 = st.columns(3)
     render_preview(c1, "Action Items", record.action_items, "No action items found.")
     render_preview(c2, "Key Decisions", record.key_decisions, "No key decisions found.")
     render_preview(c3, "Open Questions", record.open_questions, "No open questions found.")
+    with st.expander("Meeting details"):
+        details = [
+            ("Meeting date", record.meeting_date or "—"),
+            ("Processed", format_date(record.processed_at)),
+            ("Duration", format_duration(record.duration_seconds)),
+            ("Language", engine_label(record.language)),
+            ("Model", record.model or get_model_name()),
+            ("Source", (record.source or "—") + (f" ({record.source_type})" if record.source_type else "")),
+            ("Meeting ID", record.meeting_id),
+        ]
+        for label, value in details:
+            st.markdown(f"**{label}:** {escape_md(value)}")
 
 
-def transcript_html(transcript: str, query: str = "") -> tuple[str, int]:
-    sentences = re.split(r"(?<=[.!?])\s+", transcript.strip())
-    paragraphs = [" ".join(sentences[i : i + 5]) for i in range(0, len(sentences), 5)]
+def transcript_html(record: MeetingRecord, query: str = "") -> tuple[str, int]:
+    """Timestamped transcript paragraphs as HTML, with search highlighting."""
     matches = 0
-    rendered = []
-    for paragraph in paragraphs:
-        safe = esc(paragraph)
-        if query:
-            pattern = re.compile(re.escape(esc(query)), re.I)
+    rows = []
+    pattern = re.compile(re.escape(esc(query)), re.I) if query else None
+    for label, text in timestamped_paragraphs(record):
+        safe = esc(text)
+        if pattern:
             safe, found = pattern.subn(lambda m: f"<mark>{m.group(0)}</mark>", safe)
             matches += found
-        rendered.append(f"<p>{safe}</p>")
-    return f'<div class="transcript">{"".join(rendered)}</div>', matches
+            if not found:
+                continue  # while searching, show only matching paragraphs
+        stamp = f'<span class="ts">{esc(label)}</span>' if label else ""
+        rows.append(f'<div class="tline">{stamp}<p>{safe}</p></div>')
+    if not rows:
+        rows.append('<p class="muted">No matches.</p>')
+    return f'<div class="transcript">{"".join(rows)}</div>', matches
 
 
 def render_transcript(record: MeetingRecord) -> None:
-    query = st.text_input(
-        "Find in transcript", placeholder="Search for a word or phrase…", key=f"find_{record.meeting_id}"
+    left, right = st.columns([4, 1])
+    query = left.text_input(
+        "Find in transcript", placeholder="Search for a word or phrase…", key=f"find_{record.meeting_id}",
+        label_visibility="collapsed",
     ).strip()
-    body, matches = transcript_html(record.transcript, query)
+    right.download_button(
+        "Transcript", data=transcript_to_txt(record), file_name=safe_filename(record.title, "transcript.txt"),
+        mime="text/plain", icon=":material/download:", width="stretch",
+    )
+    body, matches = transcript_html(record, query)
     if query:
         st.caption(f"{matches} match{'es' if matches != 1 else ''} for “{query}”")
+    elif not record.segments:
+        st.caption("Timestamps are not available for this meeting (processed before timestamps were recorded).")
     with st.container(border=True, height=560):
         st.markdown(body, unsafe_allow_html=True)
 
 
-def render_markdown_card(content: str) -> None:
+def render_section(record: MeetingRecord, section: str, content: str) -> None:
     with st.container(border=True):
         st.markdown(content)
+    st.download_button(
+        "Download this section", data=section_to_txt(record, section),
+        file_name=safe_filename(record.title, f"{section}.txt"), mime="text/plain",
+        icon=":material/download:", key=f"dl_{section}",
+    )
+
+
+def render_chat_message(message: dict, index: int | None = None, meeting_id: str = "") -> None:
+    is_user = message["role"] == "user"
+    avatar = ":material/person:" if is_user else ":material/smart_toy:"
+    with st.chat_message(message["role"], avatar=avatar):
+        if is_user:
+            st.markdown('<span class="u-msg"></span>', unsafe_allow_html=True)  # CSS hook for user bubbles
+        st.markdown(escape_md(message["content"]) if is_user else message["content"])
+        if is_user or message.get("error"):
+            return
+        sources = message.get("sources") or []
+        if sources:
+            chips = []
+            for source in sources:
+                when = (
+                    f" · {format_timestamp(source['start_seconds'])}"
+                    if source.get("start_seconds") is not None else ""
+                )
+                chips.append(f'<span class="src">Source {source["number"]}{esc(when)}</span>')
+            st.markdown(f'<div class="srcs">{"".join(chips)}</div>', unsafe_allow_html=True)
+            with st.expander(f"Show the {len(sources)} transcript excerpt(s) used"):
+                for source in sources:
+                    details = []
+                    if source.get("meeting_date"):
+                        details.append(source["meeting_date"])
+                    if source.get("start_seconds") is not None:
+                        details.append(
+                            f"~{format_timestamp(source['start_seconds'])}–{format_timestamp(source.get('end_seconds'))}"
+                        )
+                    where = f" · {' · '.join(details)}" if details else ""
+                    st.markdown(f"**[Source {source['number']}]** {escape_md(source['title'])}{escape_md(where)}")
+                    st.caption(escape_md(source["excerpt"]))
+        if index is not None:
+            tools = st.columns([1, 1, 6])
+            with tools[0].popover("", icon=":material/content_copy:", help="Copy answer"):
+                st.code(message["content"], language=None, wrap_lines=True)
+            with tools[1]:
+                rating = st.feedback("thumbs", key=f"fb_{meeting_id}_{index}")
+                if rating is not None and message.get("rating") != rating:
+                    message["rating"] = rating
+                    persist_chats(meeting_id)
 
 
 def render_chat(record: MeetingRecord) -> None:
-    top_left, top_right = st.columns([3, 1])
-    with top_left:
+    chats = meeting_chats(record.meeting_id)
+    main_col, side_col = st.columns([3, 1.15], gap="large")
+
+    with side_col:
         scope = st.segmented_control(
-            "Search scope",
-            [SCOPE_THIS, SCOPE_ALL],
-            default=SCOPE_THIS,
-            key="chat_scope",
-            required=True,
-            help="Search only this meeting, or every meeting stored in the vector database.",
+            "Search in", [SCOPE_THIS, SCOPE_ALL], default=SCOPE_THIS, key="chat_scope", required=True,
+            help="Only this meeting, or every meeting stored in the vector database.",
         )
-    chat_key = f"{record.meeting_id}|{scope}"
-    history: list[dict] = st.session_state.chats.setdefault(chat_key, [])
-    with top_right:
-        st.write("")
-        if st.button("Clear chat", icon=":material/delete_sweep:", disabled=not history, width="stretch"):
-            st.session_state.chats[chat_key] = []
+        history: list[dict] = chats.setdefault(scope, [])
+        st.markdown('<div class="section-title" style="margin-top:.9rem">Try asking</div>', unsafe_allow_html=True)
+        for index, question in enumerate(suggested_questions(record)):
+            st.button(question, key=f"sq_{index}", width="stretch", on_click=ask_from_button, args=(question,))
+        st.markdown('<div class="section-title" style="margin-top:.9rem">Conversation</div>', unsafe_allow_html=True)
+        questions_asked = sum(1 for m in history if m["role"] == "user")
+        st.caption(f"{questions_asked} question{'s' if questions_asked != 1 else ''} · saved with this meeting")
+        st.download_button(
+            "Download chat", data=chat_to_txt(record, history), file_name=safe_filename(record.title, "chat.txt"),
+            mime="text/plain", icon=":material/download:", width="stretch", disabled=not history,
+        )
+        if st.button("Clear chat", icon=":material/delete_sweep:", width="stretch", disabled=not history):
+            chats[scope] = []
+            persist_chats(record.meeting_id)
             st.rerun()
 
-    picked = st.pills(
-        "Suggested questions",
-        SUGGESTED_QUESTIONS,
-        key=f"pill_{chat_key}_{len(history)}",
-        label_visibility="collapsed",
-    )
+    with main_col:
+        box = st.container(height=540, border=True)
+        with box:
+            if not history:
+                st.markdown(
+                    '<div class="chat-empty"><div class="big">💬</div>'
+                    "<div><b>Chat with your meeting</b></div>"
+                    "<div class='muted'>Ask anything about what was said. Answers are grounded in the transcript "
+                    "and show the excerpts (with timestamps) they came from. In <i>All meetings</i> you can also ask "
+                    "about time periods, e.g. “What did we decide last week?”.</div></div>",
+                    unsafe_allow_html=True,
+                )
+            for index, message in enumerate(history):
+                render_chat_message(message, index if message["role"] == "assistant" else None, record.meeting_id)
 
-    box = st.container(height=470, border=True)
-    with box:
-        if not history:
-            st.caption(
-                "Ask anything about this meeting. Answers are generated by Gemini only from the "
-                "retrieved transcript excerpts, with sources."
-            )
-        for message in history:
-            render_chat_message(message)
-
-    prompt = st.chat_input(
-        "Ask about this meeting…" if scope == SCOPE_THIS else "Ask about any of your meetings…",
-        key=f"chat_input_{record.meeting_id}",
-    )
-    question = (prompt or picked or "").strip()
+        prompt = st.chat_input(
+            "Ask about this meeting…" if scope == SCOPE_THIS else "Ask about any of your meetings…",
+            key=f"chat_input_{record.meeting_id}",
+        )
+    question = (prompt or st.session_state.pop("pending_question", None) or "").strip()
     if not question:
         return
 
     with box:
         render_chat_message({"role": "user", "content": question})
         with st.chat_message("assistant", avatar=":material/smart_toy:"):
-            with st.spinner("Searching the transcript and asking Gemini…"):
-                try:
-                    chain = get_rag_chain(record.meeting_id if scope == SCOPE_THIS else None)
-                    result = ask_question(chain, question, history)
-                    reply = {"role": "assistant", "content": result["answer"], "sources": result["sources"]}
-                except (LLMError, ValueError) as exc:
-                    reply = {"role": "assistant", "content": f"⚠️ {exc}", "sources": [], "error": True}
+            reply: dict = {"role": "assistant", "sources": []}
+            try:
+                with st.spinner("Searching the transcript…"):
+                    info, chunks = stream_answer(
+                        question,
+                        meeting_id=record.meeting_id if scope == SCOPE_THIS else None,
+                        chat_history=history,
+                        current_meeting_id=record.meeting_id,
+                    )
+                reply["content"] = st.write_stream(chunks)
+                reply["sources"] = info["sources"]
+                if isinstance(reply["content"], list):
+                    reply["content"] = "".join(str(part) for part in reply["content"])
+            except (LLMError, ValueError) as exc:
+                reply.update(content=f"⚠️ {exc}", error=True)
     history.append({"role": "user", "content": question})
     history.append(reply)
+    persist_chats(record.meeting_id)
     st.rerun()
 
 
-def render_chat_message(message: dict) -> None:
-    is_user = message["role"] == "user"
-    avatar = ":material/person:" if is_user else ":material/smart_toy:"
-    with st.chat_message(message["role"], avatar=avatar):
-        st.markdown(escape_md(message["content"]) if is_user else message["content"])
-        sources = message.get("sources") or []
-        if sources:
-            with st.expander(f"Sources ({len(sources)})"):
-                for source in sources:
-                    segment = source.get("chunk_index")
-                    where = f" · segment {int(segment) + 1}" if segment is not None else ""
-                    st.markdown(f"**[Source {source['number']}]** {escape_md(source['title'])}{where}")
-                    st.caption(escape_md(source["excerpt"]))
+def render_downloads(record: MeetingRecord) -> None:
+    messages = all_messages(record.meeting_id)
+    items = [
+        ("Full report", "PDF with summary, action items, decisions, open questions, Q&A and the timestamped transcript.",
+         lambda: build_pdf_report(record, chat=messages), "report.pdf", "application/pdf", ":material/picture_as_pdf:"),
+        ("Everything", "ZIP with every file below plus the PDF and the raw meeting data (JSON).",
+         lambda: export_bundle(record, messages), "meeting.zip", "application/zip", ":material/folder_zip:"),
+        ("Transcript", "Full transcript with [mm:ss] timestamps.",
+         transcript_to_txt(record), "transcript.txt", "text/plain", ":material/description:"),
+        ("Summary", "Overview, topics, outcomes and next steps.",
+         section_to_txt(record, "summary"), "summary.txt", "text/plain", ":material/summarize:"),
+        ("Action items", "Tasks with owners and deadlines (only when stated).",
+         section_to_txt(record, "action_items"), "action_items.txt", "text/plain", ":material/task_alt:"),
+        ("Key decisions", "Decisions that were explicitly made.",
+         section_to_txt(record, "key_decisions"), "key_decisions.txt", "text/plain", ":material/gavel:"),
+        ("Open questions", "Unresolved questions and follow-ups.",
+         section_to_txt(record, "open_questions"), "open_questions.txt", "text/plain", ":material/help:"),
+        ("Q&A chat", f"Your questions and the answers with sources ({sum(m['role'] == 'user' for m in messages)} asked).",
+         chat_to_txt(record, messages), "chat.txt", "text/plain", ":material/forum:"),
+    ]
+    columns = st.columns(2)
+    for index, (name, description, data, suffix, mime, icon) in enumerate(items):
+        with columns[index % 2].container(border=True):
+            st.markdown(f"**{name}**")
+            st.caption(description)
+            st.download_button(
+                f"Download {name.lower()}", data=data, file_name=safe_filename(record.title, suffix), mime=mime,
+                icon=icon, key=f"dlall_{suffix}", width="stretch",
+            )
 
 
 def render_meeting(record: MeetingRecord) -> None:
     render_meeting_header(record)
-    render_metrics_and_exports(record)
+    render_metrics_and_actions(record)
     st.write("")
     tabs = st.tabs(TAB_NAMES, key="meeting_tab", on_change="rerun")
     renderers = {
         "Overview": lambda: render_overview(record),
+        CHAT_TAB: lambda: render_chat(record),
         "Transcript": lambda: render_transcript(record),
-        "Summary": lambda: render_markdown_card(record.summary),
-        "Action Items": lambda: render_markdown_card(record.action_items),
-        "Key Decisions": lambda: render_markdown_card(record.key_decisions),
-        "Open Questions": lambda: render_markdown_card(record.open_questions),
-        "Ask Your Meeting": lambda: render_chat(record),
+        "Summary": lambda: render_section(record, "summary", record.summary),
+        "Action Items": lambda: render_section(record, "action_items", record.action_items),
+        "Key Decisions": lambda: render_section(record, "key_decisions", record.key_decisions),
+        "Open Questions": lambda: render_section(record, "open_questions", record.open_questions),
+        "Downloads": lambda: render_downloads(record),
     }
     for name, tab in zip(TAB_NAMES, tabs):
         if tab.open:

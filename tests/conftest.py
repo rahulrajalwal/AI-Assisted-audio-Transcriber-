@@ -23,7 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import core.config  # noqa: E402  (loads .env once; tests then override env vars)
 
 
-class FakeGemini(BaseChatModel):
+class FakeGemini(BaseChatModel):  # name kept for history; stands in for any chat model
     """Chat model stand-in that records every prompt and returns scripted replies."""
 
     responder: Any = None  # str | AIMessage | Exception | callable(messages) -> any of these
@@ -51,25 +51,59 @@ class FakeGemini(BaseChatModel):
 
 @pytest.fixture(autouse=True)
 def isolated_storage(tmp_path, monkeypatch):
-    """Point every persistent directory at a temporary location."""
+    """Temporary storage folders and NO access to the real OpenRouter API."""
     monkeypatch.setenv("CHROMA_DIR", str(tmp_path / "vector_db"))
     monkeypatch.setenv("MEETINGS_DIR", str(tmp_path / "meetings"))
     monkeypatch.setenv("WORK_DIR", str(tmp_path / "work"))
-    monkeypatch.setenv("GEMINI_MIN_REQUEST_INTERVAL", "0")
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key-1234567890")
+    # A closed local port: unit tests must never send requests (or spend quota) on OpenRouter.
+    monkeypatch.setenv("OPENROUTER_BASE_URL", "http://127.0.0.1:9/api/v1")
     monkeypatch.setattr(core.config, "_env_loaded", True)
+    import core.llm as llm_module
+
+    monkeypatch.setattr(llm_module, "MIN_REQUEST_INTERVAL_SECONDS", 0)
     yield tmp_path
 
 
-@pytest.fixture
-def fake_api_key(monkeypatch):
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-1234567890")
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.setenv("GEMINI_MODEL", "gemini-3.8-flash")
+def _status(ready: bool = True, **overrides):
+    from core.llm import OpenRouterStatus
+
+    data = dict(
+        key_configured=True,
+        model="openai/gpt-4o-mini",
+        reachable=ready,
+        key_valid=ready,
+        model_available=ready,
+        daily_used=3 if ready else None,
+        daily_limit=50 if ready else None,
+        daily_remaining=47 if ready else None,
+        error="" if ready else "Could not reach OpenRouter (ConnectError). Check your internet connection.",
+    )
+    data.update(overrides)
+    return OpenRouterStatus(**data)
 
 
 @pytest.fixture
-def fake_llm(monkeypatch, fake_api_key) -> Callable[..., FakeGemini]:
-    """Install a FakeGemini as the shared model. Usage: llm = fake_llm("reply")."""
+def llm_ready(monkeypatch):
+    """Pretend OpenRouter is reachable, the key valid and the model available."""
+    import core.llm
+
+    monkeypatch.setattr(core.llm, "check_openrouter", lambda timeout=10.0: _status(True))
+
+
+@pytest.fixture
+def llm_down(monkeypatch):
+    """Pretend OpenRouter cannot be reached."""
+    import core.llm
+
+    monkeypatch.setattr(core.llm, "check_openrouter", lambda timeout=10.0: _status(False))
+
+
+@pytest.fixture
+def fake_llm(monkeypatch, llm_ready) -> Callable[..., FakeGemini]:
+    """Install a fake chat model as the shared LLM. Usage: llm = fake_llm("reply")."""
 
     def install(responder: Any = "ok") -> FakeGemini:
         model = FakeGemini(responder=responder)
@@ -114,3 +148,6 @@ SAMPLE_TRANSCRIPT = (
     "Anil asked who will approve the extra spending, and that question is still open. "
     "We will discuss it again next week. Thanks everyone."
 )
+
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"

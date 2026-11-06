@@ -1,13 +1,17 @@
-"""Map-Reduce meeting summarisation and title generation with Gemini (LangChain LCEL).
+"""Map-Reduce meeting summarisation and title generation (LangChain LCEL).
+
+The chat model comes from ``core.llm`` (active provider: OpenRouter, model from OPENROUTER_MODEL;
+the Gemini and Mistral integrations are preserved there in an inactive section).
 
 Strategy
 --------
-* Short transcripts (≤ ``SINGLE_PASS_MAX_CHARS``) are summarised in one call.
-* Longer transcripts are split into overlapping chunks (MAP); each chunk is
-  summarised; intermediate summaries are then *collapsed* in groups until they
-  fit within ``REDUCE_MAX_CHARS`` (bounded number of rounds); finally one REDUCE
-  call writes the structured summary. This keeps every request well inside
-  Gemini's context/output limits no matter how long the recording is.
+* All sizes derive from the model's context window (``core.llm.input_char_budget``),
+  so with a small local context (e.g. 4096 tokens) no prompt is ever truncated.
+* A transcript that fits the budget is summarised in one call.
+* Longer transcripts are split into overlapping chunks (MAP, processed one at a
+  time); intermediate summaries are *collapsed* hierarchically in groups until they
+  fit the budget (bounded rounds); one REDUCE call writes the final summary.
+  Nothing is dropped: every part of the transcript passes through a MAP call.
 """
 
 from __future__ import annotations
@@ -20,25 +24,29 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable, RunnableLambda, RunnablePassthrough
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from core.llm import build_text_chain, invoke_with_retry
+from core.llm import build_text_chain, input_char_budget, invoke_with_retry
 
 logger = logging.getLogger(__name__)
 
-# Sizes are in characters (~4 characters per token for English text).
-SINGLE_PASS_MAX_CHARS = 60_000  # ≈15k tokens ≈ 75–90 minutes of speech
-MAP_CHUNK_CHARS = 24_000
-MAP_CHUNK_OVERLAP = 800
-REDUCE_MAX_CHARS = 40_000
-MAX_COLLAPSE_ROUNDS = 4
-TITLE_INPUT_MAX_CHARS = 8_000
+# Sizes are in characters. ``None`` means "derive from the model's context window"
+# (core.llm.input_char_budget); set an int to override (tests do this).
+SINGLE_PASS_MAX_CHARS: int | None = None
+MAP_CHUNK_CHARS: int | None = None
+MAP_CHUNK_OVERLAP = 300
+REDUCE_MAX_CHARS: int | None = None
+MAX_COLLAPSE_ROUNDS = 6
+TITLE_INPUT_MAX_CHARS = 4_000
+MAP_SUMMARY_MAX_WORDS = 180  # keeps intermediate summaries small so reductions fit
 TITLE_MAX_WORDS = 10
 
 ProgressFn = Callable[[str, float | None], None]
 
 _FAITHFULNESS = (
     "Use ONLY information stated in the provided text. Never invent names, numbers, "
-    "dates, decisions or commitments. If something is unclear in the text, say so "
-    "rather than guessing. Write in clear, professional English."
+    "dates, decisions or commitments, and never attribute a statement or approval to someone "
+    "unless the text says who it was. Keep dates and deadlines exactly as said (e.g. 'Wednesday', "
+    "'the fourteenth') - do not add months, years or weekdays. If something is unclear in the "
+    "text, say so rather than guessing. Write in clear, professional English."
 )
 
 FINAL_SUMMARY_FORMAT = """Use exactly this Markdown structure (omit a section only if the text has nothing for it):
@@ -58,12 +66,26 @@ FINAL_SUMMARY_FORMAT = """Use exactly this Markdown structure (omit a section on
 Keep it concise, avoid repetition, and prioritise information that matters to someone who missed the meeting."""
 
 
+def single_pass_max_chars() -> int:
+    return SINGLE_PASS_MAX_CHARS or input_char_budget()
+
+
+def map_chunk_chars() -> int:
+    return MAP_CHUNK_CHARS or int(input_char_budget() * 0.9)
+
+
+def reduce_max_chars() -> int:
+    return REDUCE_MAX_CHARS or input_char_budget()
+
+
 def split_transcript(
     transcript: str,
-    chunk_size: int = MAP_CHUNK_CHARS,
-    chunk_overlap: int = MAP_CHUNK_OVERLAP,
+    chunk_size: int | None = None,
+    chunk_overlap: int | None = None,
 ) -> list[str]:
     """Split a transcript into overlapping chunks for the MAP step."""
+    chunk_size = chunk_size or map_chunk_chars()
+    chunk_overlap = MAP_CHUNK_OVERLAP if chunk_overlap is None else chunk_overlap
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
@@ -84,7 +106,8 @@ def build_map_chain() -> Runnable:
                 + _FAITHFULNESS
                 + "\nCapture every substantive point: topics, facts and figures, opinions, "
                 "decisions, action items (with owners/deadlines only if stated) and open "
-                "questions. Use compact bullet points. Do not add an introduction.",
+                f"questions. Use compact bullet points, at most {MAP_SUMMARY_MAX_WORDS} words. "
+                "Do not add an introduction.",
             ),
             ("human", "Transcript portion {part} of {total}:\n\n{text}"),
         ]
@@ -181,10 +204,11 @@ def _group_by_length(texts: list[str], max_chars: int) -> list[list[str]]:
 def collapse_summaries(
     summaries: list[str],
     collapse_fn: Callable[[str], str],
-    max_chars: int = REDUCE_MAX_CHARS,
+    max_chars: int | None = None,
     max_rounds: int = MAX_COLLAPSE_ROUNDS,
 ) -> list[str]:
     """Recursively merge intermediate summaries until they fit in ``max_chars``."""
+    max_chars = max_chars or reduce_max_chars()
     rounds = 0
     while sum(len(s) for s in summaries) > max_chars and len(summaries) > 1:
         if rounds >= max_rounds:
@@ -214,7 +238,7 @@ def summarize(transcript: str, progress: ProgressFn | None = None) -> str:
 
     final_chain = build_final_chain()
 
-    if len(text) <= SINGLE_PASS_MAX_CHARS:
+    if len(text) <= single_pass_max_chars():
         report("Summarising transcript (single pass)", 0.1)
         return invoke_with_retry(
             final_chain,
@@ -222,7 +246,7 @@ def summarize(transcript: str, progress: ProgressFn | None = None) -> str:
             task="Meeting summary",
         )
 
-    chunks = split_transcript(text, MAP_CHUNK_CHARS, MAP_CHUNK_OVERLAP)
+    chunks = split_transcript(text)
     map_chain = build_map_chain()
     partials: list[str] = []
     for index, chunk in enumerate(chunks, start=1):

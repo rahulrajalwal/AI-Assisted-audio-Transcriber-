@@ -1,16 +1,20 @@
-"""Gemini configuration, response handling and retry behaviour (offline)."""
+"""OpenRouter configuration, status checks, response handling and retries (offline).
+
+One live test at the bottom makes exactly ONE real OpenRouter request; it runs only
+when LIVE_OPENROUTER=1 is set (it uses one request of the 50/day free quota).
+"""
 
 from __future__ import annotations
 
+import os
+import time
+
+import httpx
+import openai
 import pytest
 from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai.chat_models import (
-    GoogleAPIError,
-    GoogleAuthenticationError,
-    GoogleModelNotFoundError,
-    GoogleRateLimitError,
-)
+from langchain_core.runnables import RunnableLambda
 
 import core.llm as llm_module
 from core.llm import (
@@ -19,56 +23,138 @@ from core.llm import (
     LLMEmptyResponseError,
     LLMServiceError,
     build_text_chain,
+    check_openrouter,
     classify_error,
+    ensure_llm_ready,
     get_llm,
+    input_char_budget,
     invoke_with_retry,
+    stream_with_retry,
 )
-from langchain_core.runnables import RunnableLambda
+
+REQUEST = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
 
 
-def _server_error(code: int = 503) -> GoogleAPIError:
-    return GoogleAPIError(
-        code, {"error": {"code": code, "message": "high demand", "status": "UNAVAILABLE"}}, None
-    )
+def api_error(cls, status: int, message: str, headers: dict | None = None):
+    return cls(message, response=httpx.Response(status, headers=headers or {}, request=REQUEST), body=None)
 
 
-class TestInitialisation:
-    def test_builds_gemini_without_sampling_params(self, fake_api_key):
+class TestConfiguration:
+    def test_builds_chat_openai_against_openrouter(self):
         model = get_llm()
-        assert type(model).__name__ == "ChatGoogleGenerativeAI"
-        assert model.model == "gemini-3.8-flash"
-        assert model.temperature is None  # Gemini 3: no custom sampling
-        assert model.top_p is None and model.top_k is None
-        assert model.n == 1
-        assert model.max_retries == 1  # retries handled by invoke_with_retry
-        assert model.thinking_budget is None
+        assert type(model).__name__ == "ChatOpenAI"
+        assert model.model_name == "openai/gpt-4o-mini"
+        assert model.openai_api_base == "http://127.0.0.1:9/api/v1"  # test override of OPENROUTER_BASE_URL
+        assert model.temperature == 0
+        assert model.max_retries == 0  # retries limited by invoke_with_retry (free-tier quota)
 
-    def test_model_is_cached_between_calls(self, fake_api_key):
+    def test_default_endpoint_and_model(self, monkeypatch):
+        monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+        monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
+        model = get_llm()
+        assert model.openai_api_base == "https://openrouter.ai/api/v1"
+        assert model.model_name == "openai/gpt-4o-mini"  # default: GPT-4o mini
+
+    def test_model_configurable(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_MODEL", "google/gemma-4-26b-a4b-it:free")
+        assert get_llm().model_name == "google/gemma-4-26b-a4b-it:free"
+
+    def test_edited_env_file_applies_without_restart(self, monkeypatch, tmp_path):
+        """Regression: the running app kept the old model after .env was edited."""
+        import core.config
+
+        env_file = tmp_path / ".env"
+        env_file.write_text("OPENROUTER_MODEL=google/gemma-4-31b-it:free\n", encoding="utf-8")
+        monkeypatch.setattr(core.config, "ENV_FILE", env_file)
+        assert core.config.reload_environment()
+        assert get_llm().model_name == "google/gemma-4-31b-it:free"
+        env_file.write_text("OPENROUTER_MODEL=openai/gpt-4o-mini\n", encoding="utf-8")
+        core.config.reload_environment()
+        assert get_llm().model_name == "openai/gpt-4o-mini"
+
+    def test_pacing_only_for_free_models(self, monkeypatch):
+        sleeps = []
+        monkeypatch.setattr(llm_module, "MIN_REQUEST_INTERVAL_SECONDS", 3.1)
+        monkeypatch.setattr(llm_module.time, "sleep", lambda s: sleeps.append(s))
+        llm_module._throttle(); llm_module._throttle()
+        assert sleeps == []  # paid default model: no 20/minute pacing
+        monkeypatch.setenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")
+        llm_module._throttle(); llm_module._throttle()
+        assert sleeps and sleeps[0] > 0
+
+    def test_model_cached_and_no_network_on_init(self):
         assert get_llm() is get_llm()
 
-    def test_thinking_level_is_passed(self, fake_api_key):
-        assert get_llm("low").reasoning_effort == "low"
-
-    def test_minimal_thinking_level_rejected(self, fake_api_key):
-        with pytest.raises(LLMConfigurationError, match="minimal"):
-            get_llm("minimal")
-
-    def test_model_name_from_env(self, fake_api_key, monkeypatch):
-        monkeypatch.setenv("GEMINI_MODEL", "gemini-3.6-flash")
-        assert get_llm().model == "gemini-3.6-flash"
-
-    def test_missing_api_key_gives_actionable_error(self, monkeypatch):
-        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-        with pytest.raises(LLMConfigurationError, match="GOOGLE_API_KEY"):
+    def test_missing_api_key(self, monkeypatch):
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        with pytest.raises(LLMConfigurationError, match="OPENROUTER_API_KEY"):
             get_llm()
-        assert llm_module.is_llm_configured() is False
+        status = check_openrouter()
+        assert not status.key_configured and not status.ready and "OPENROUTER_API_KEY" in status.error
 
-    def test_gemini_api_key_fallback(self, monkeypatch):
-        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-        monkeypatch.setenv("GEMINI_API_KEY", "fallback-key-123456")
-        assert llm_module.is_llm_configured() is True
-        assert get_llm().google_api_key.get_secret_value() == "fallback-key-123456"
+    @pytest.mark.parametrize("provider", ["gemini", "mistral"])
+    def test_legacy_providers_are_inactive(self, monkeypatch, provider):
+        monkeypatch.setenv("LLM_PROVIDER", provider)
+        with pytest.raises(LLMConfigurationError, match="inactive"):
+            get_llm()
+        with pytest.raises(LLMConfigurationError, match="INACTIVE"):
+            ensure_llm_ready()
+
+    def test_no_ollama_gemini_or_mistral_imported(self):
+        import sys
+
+        get_llm()
+        for module in ("langchain_ollama", "ollama", "langchain_mistralai", "langchain_google_genai"):
+            assert module not in sys.modules, module
+
+    def test_input_budget_keeps_requests_few_but_bounded(self):
+        budget = input_char_budget()
+        assert 60_000 <= budget <= 100_000  # a one-hour meeting fits in one summary request
+
+
+class TestStatusCheck:
+    def test_unreachable(self):
+        status = check_openrouter(timeout=0.5)
+        assert status.key_configured and not status.ready
+        assert "Could not reach OpenRouter" in status.error
+
+    def _fake_http(self, monkeypatch, key_status=200, remaining=40, model_status=200, endpoints=1):
+        def fake_get(url, headers=None, timeout=None):
+            if url.endswith("/key"):
+                data = {"data": {"free_model_daily_requests": {"used": 50 - remaining, "limit": 50, "remaining": remaining}}}
+                return httpx.Response(key_status, json=data, request=httpx.Request("GET", url))
+            data = {"data": {"endpoints": [{}] * endpoints}}
+            return httpx.Response(model_status, json=data, request=httpx.Request("GET", url))
+
+        monkeypatch.setattr(httpx, "get", fake_get)
+
+    def test_ready_with_quota(self, monkeypatch):
+        self._fake_http(monkeypatch)
+        status = check_openrouter()
+        assert status.ready and (status.daily_used, status.daily_limit, status.daily_remaining) == (10, 50, 40)
+
+    def test_invalid_key(self, monkeypatch):
+        self._fake_http(monkeypatch, key_status=401)
+        status = check_openrouter()
+        assert not status.ready and "rejected the API key" in status.error
+
+    def test_model_unavailable_no_fallback(self, monkeypatch):
+        self._fake_http(monkeypatch, model_status=404)
+        status = check_openrouter()
+        assert not status.ready and "not available" in status.error and "no other model" in status.error
+
+    def test_free_quota_does_not_block_paid_model(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_MODEL", "google/gemma-4-31b-it")
+        self._fake_http(monkeypatch, remaining=0)
+        assert check_openrouter().ready
+
+    def test_daily_quota_exhausted(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")
+        self._fake_http(monkeypatch, remaining=0)
+        status = check_openrouter()
+        assert not status.ready and "used up" in status.error
+        with pytest.raises(LLMConfigurationError, match="used up"):
+            ensure_llm_ready()
 
 
 class TestResponseHandling:
@@ -79,31 +165,21 @@ class TestResponseHandling:
     def test_plain_string_output(self, fake_llm):
         assert self._chain(fake_llm, "  Hello  ").invoke({"q": "x"}) == "Hello"
 
-    def test_content_blocks_drop_thoughts(self, fake_llm):
-        reply = AIMessage(
-            content=[
-                {"type": "thinking", "thinking": "internal reasoning"},
-                {"type": "text", "text": "Final answer"},
-            ]
-        )
-        assert self._chain(fake_llm, reply).invoke({"q": "x"}) == "Final answer"
+    def test_leaked_think_block_is_removed(self, fake_llm):
+        assert self._chain(fake_llm, "<think>reasoning</think>\nFinal").invoke({"q": "x"}) == "Final"
 
-    def test_blocked_response_raises(self, fake_llm):
-        reply = AIMessage(content="", response_metadata={"finish_reason": "SAFETY"})
-        with pytest.raises(LLMBlockedResponseError):
-            self._chain(fake_llm, reply).invoke({"q": "x"})
-
-    def test_empty_response_raises(self, fake_llm):
-        with pytest.raises(LLMEmptyResponseError):
-            self._chain(fake_llm, AIMessage(content="")).invoke({"q": "x"})
-
-    def test_max_tokens_without_text_explains(self, fake_llm):
-        reply = AIMessage(content="", response_metadata={"finish_reason": "MAX_TOKENS"})
+    def test_output_limit_without_text(self, fake_llm):
+        reply = AIMessage(content="", response_metadata={"finish_reason": "length"})
         with pytest.raises(LLMEmptyResponseError, match="output-token limit"):
             self._chain(fake_llm, reply).invoke({"q": "x"})
 
+    def test_blocked_response(self, fake_llm):
+        reply = AIMessage(content="", response_metadata={"finish_reason": "content_filter"})
+        with pytest.raises(LLMBlockedResponseError):
+            self._chain(fake_llm, reply).invoke({"q": "x"})
 
-class TestRetry:
+
+class TestRetries:
     def _flaky(self, errors):
         state = {"calls": 0}
 
@@ -115,93 +191,128 @@ class TestRetry:
 
         return RunnableLambda(run), state
 
-    def test_retries_transient_503_then_succeeds(self, no_sleep):
-        runnable, state = self._flaky([_server_error(), _server_error()])
-        assert invoke_with_retry(runnable, None, task="t") == "done"
-        assert state["calls"] == 3
-        assert len(no_sleep) == 2 and no_sleep[1] > no_sleep[0]  # exponential backoff
-
-    def test_honours_server_retry_delay(self, no_sleep):
-        err = GoogleRateLimitError("429 RESOURCE_EXHAUSTED. {'retryDelay': '17s'}")
-        runnable, _ = self._flaky([err])
-        invoke_with_retry(runnable, None, task="t")
-        assert no_sleep[0] >= 17
-
-    def test_retry_delay_is_capped(self, no_sleep):
-        err = GoogleRateLimitError("429 RESOURCE_EXHAUSTED. {'retryDelay': '900s'}")
-        runnable, _ = self._flaky([err])
-        invoke_with_retry(runnable, None, task="t")
-        assert no_sleep[0] <= llm_module.MAX_RETRY_DELAY_SECONDS
-
-    def test_auth_error_not_retried(self, no_sleep, fake_api_key):
-        runnable, state = self._flaky([GoogleAuthenticationError("401 UNAUTHENTICATED bad key")])
-        with pytest.raises(LLMServiceError, match="401"):
-            invoke_with_retry(runnable, None, task="Summary")
-        assert state["calls"] == 1 and no_sleep == []
-
-    def test_model_not_found_not_retried(self, no_sleep, fake_api_key):
-        runnable, state = self._flaky([GoogleModelNotFoundError("404 NOT_FOUND models/x")])
-        with pytest.raises(LLMServiceError, match="not available"):
-            invoke_with_retry(runnable, None, task="Summary")
-        assert state["calls"] == 1
-
-    def test_daily_quota_fails_fast(self, no_sleep, fake_api_key):
-        err = GoogleRateLimitError(
-            "429 RESOURCE_EXHAUSTED quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier"
-        )
+    def test_per_minute_rate_limit_retried_once_honouring_retry_after(self, no_sleep):
+        err = api_error(openai.RateLimitError, 429, "Rate limit exceeded: free-models-per-min", {"Retry-After": "7"})
         runnable, state = self._flaky([err])
-        with pytest.raises(LLMServiceError, match="daily request quota"):
-            invoke_with_retry(runnable, None, task="Summary")
-        assert state["calls"] == 1
-
-    def test_real_free_tier_daily_quota_message(self, no_sleep, fake_api_key):
-        """Format copied from a real Gemini 429 response (free tier, 20 requests/day)."""
-        err = GoogleRateLimitError(
-            "Error calling model 'gemini-3.8-flash' (RESOURCE_EXHAUSTED): 429 RESOURCE_EXHAUSTED. "
-            "{'error': {'code': 429, 'message': '* Quota exceeded for metric: "
-            "generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, "
-            "model: gemini-3.8-flash, description: Generate content requests per day limit exceeded "
-            "on Free Tier.', 'details': [{'quotaId': 'GenerateRequestsPerDayPerProjectPerModel-FreeTier'}, "
-            "{'@type': 'type.googleapis.com/google.rpc.RetryInfo', 'retryDelay': '49656s'}]}}"
-        )
-        runnable, state = self._flaky([err])
-        with pytest.raises(LLMServiceError) as info:
-            invoke_with_retry(runnable, None, task="Meeting summary")
-        message = str(info.value)
-        assert "20 requests/day" in message and "13h 47m" in message
-        assert state["calls"] == 1 and no_sleep == []
-
-    def test_bounded_attempts(self, no_sleep, fake_api_key):
-        runnable, state = self._flaky([_server_error() for _ in range(10)])
-        with pytest.raises(LLMServiceError, match="overloaded"):
-            invoke_with_retry(runnable, None, task="Summary", max_attempts=3)
-        assert state["calls"] == 3
-
-    def test_empty_response_is_retried(self, no_sleep):
-        runnable, state = self._flaky([LLMEmptyResponseError("empty")])
         assert invoke_with_retry(runnable, None) == "done"
-        assert state["calls"] == 2
+        assert state["calls"] == 2 and no_sleep[0] >= 7
 
-    def test_blocked_response_not_retried(self, no_sleep):
-        runnable, state = self._flaky([LLMBlockedResponseError("blocked")])
-        with pytest.raises(LLMBlockedResponseError):
+    def test_upstream_provider_limit_explained(self, no_sleep):
+        """Real OpenRouter body seen live: the free model's upstream provider was saturated."""
+        body = {"error": {"code": 429, "message": "Provider returned error", "metadata": {
+            "provider_name": "Google AI Studio",
+            "raw": "google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly"}}}
+        errors = [openai.RateLimitError("Error code: 429 - Provider returned error",
+                                        response=httpx.Response(429, request=REQUEST), body=body) for _ in range(3)]
+        runnable, state = self._flaky(errors)
+        with pytest.raises(LLMServiceError, match="rate-limited by its provider") as info:
+            invoke_with_retry(runnable, None)
+        assert "not your daily quota" in str(info.value)
+        assert state["calls"] == 2  # retried once, then a clear message (no model fallback)
+
+    def test_daily_quota_fails_fast_without_retry(self, no_sleep):
+        err = api_error(openai.RateLimitError, 429, "Rate limit exceeded: free-models-per-day")
+        runnable, state = self._flaky([err])
+        with pytest.raises(LLMServiceError, match="limit for today") as info:
+            invoke_with_retry(runnable, None, task="Meeting summary")
+        assert "transcript and meeting data are kept" in str(info.value)
+        assert state["calls"] == 1 and no_sleep == []
+
+    def test_long_reset_header_treated_as_daily_quota(self, no_sleep):
+        reset_ms = str(int((time.time() + 6 * 3600) * 1000))
+        err = api_error(openai.RateLimitError, 429, "Rate limit exceeded", {"X-RateLimit-Reset": reset_ms})
+        runnable, state = self._flaky([err])
+        with pytest.raises(LLMServiceError, match="limit for today"):
             invoke_with_retry(runnable, None)
         assert state["calls"] == 1
 
-    def test_unknown_bug_not_retried(self, no_sleep, fake_api_key):
+    def test_retries_are_bounded(self, no_sleep):
+        errors = [api_error(openai.InternalServerError, 503, "upstream busy") for _ in range(5)]
+        runnable, state = self._flaky(errors)
+        with pytest.raises(LLMServiceError, match="temporarily unavailable"):
+            invoke_with_retry(runnable, None)
+        assert state["calls"] == 2  # at most one retry by default
+
+    def test_bad_key_not_retried(self, no_sleep):
+        runnable, state = self._flaky([api_error(openai.AuthenticationError, 401, "No auth credentials found")])
+        with pytest.raises(LLMServiceError, match="rejected the API key"):
+            invoke_with_retry(runnable, None)
+        assert state["calls"] == 1
+
+    def test_unknown_model_not_retried_and_no_fallback(self, no_sleep):
+        runnable, state = self._flaky([api_error(openai.NotFoundError, 404, "No endpoints found")])
+        with pytest.raises(LLMServiceError, match="not available on OpenRouter") as info:
+            invoke_with_retry(runnable, None)
+        assert "no other model is used" in str(info.value) and state["calls"] == 1
+
+    def test_network_error_retried(self, no_sleep):
+        runnable, state = self._flaky([openai.APIConnectionError(request=REQUEST)])
+        assert invoke_with_retry(runnable, None) == "done"
+        assert state["calls"] == 2
+
+    def test_empty_response_retried(self, no_sleep):
+        runnable, state = self._flaky([LLMEmptyResponseError("empty")])
+        assert invoke_with_retry(runnable, None) == "done"
+
+    def test_unknown_bug_not_retried(self, no_sleep):
         runnable, state = self._flaky([KeyError("missing")])
         with pytest.raises(LLMServiceError):
             invoke_with_retry(runnable, None)
         assert state["calls"] == 1
 
-    def test_timeouts_are_retryable(self):
+    def test_classification(self):
         assert classify_error(TimeoutError()) == "retryable"
-        assert classify_error(ConnectionError()) == "retryable"
+        assert classify_error(api_error(openai.BadRequestError, 400, "bad")) == "permanent"
 
-    def test_api_key_is_redacted_from_errors(self, no_sleep, monkeypatch):
-        secret = "AIzaSySECRETSECRETSECRET"
-        monkeypatch.setenv("GOOGLE_API_KEY", secret)
-        runnable, _ = self._flaky([RuntimeError(f"bad request with key={secret}")])
+    def test_api_key_redacted(self, no_sleep, monkeypatch):
+        secret = "sk-or-v1-SECRETSECRETSECRET"
+        monkeypatch.setenv("OPENROUTER_API_KEY", secret)
+        runnable, _ = self._flaky([RuntimeError(f"bad request key={secret}")])
         with pytest.raises(LLMServiceError) as info:
             invoke_with_retry(runnable, None)
         assert secret not in str(info.value)
+
+
+class TestStreamRetry:
+    class Flaky:
+        def __init__(self, plan):
+            self.plan, self.calls = plan, 0
+
+        def stream(self, payload):
+            step = self.plan[self.calls]
+            self.calls += 1
+            for item in step:
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+
+    def test_retries_before_first_chunk(self, no_sleep):
+        runnable = self.Flaky([[openai.APIConnectionError(request=REQUEST)], ["Hel", "lo"]])
+        assert "".join(stream_with_retry(runnable, None)) == "Hello" and runnable.calls == 2
+
+    def test_no_retry_after_text_was_shown(self, no_sleep):
+        runnable = self.Flaky([["Partial ", openai.APIConnectionError(request=REQUEST)], ["never"]])
+        produced = []
+        with pytest.raises(LLMServiceError):
+            for chunk in stream_with_retry(runnable, None):
+                produced.append(chunk)
+        assert produced == ["Partial "] and runnable.calls == 1
+
+    def test_empty_stream_is_an_error(self, no_sleep):
+        with pytest.raises(LLMServiceError):
+            list(stream_with_retry(self.Flaky([[], []]), None))
+
+
+@pytest.mark.openrouter
+@pytest.mark.skipif(not os.getenv("LIVE_OPENROUTER"), reason="set LIVE_OPENROUTER=1 (sends 1 real request)")
+def test_live_openrouter_generation(monkeypatch):
+    """Exactly one real request through the project's LCEL chain."""
+    from dotenv import dotenv_values
+
+    env = dotenv_values(os.path.join(os.path.dirname(__file__), "..", ".env"))
+    monkeypatch.setenv("OPENROUTER_API_KEY", env.get("OPENROUTER_API_KEY") or "")
+    monkeypatch.setenv("OPENROUTER_BASE_URL", env.get("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("OPENROUTER_MODEL", env.get("OPENROUTER_MODEL") or "openai/gpt-4o-mini")
+    monkeypatch.setattr(llm_module, "DEFAULT_MAX_ATTEMPTS", 1)
+    chain = build_text_chain(ChatPromptTemplate.from_messages([("human", "Reply with exactly the word: READY")]))
+    assert "READY" in invoke_with_retry(chain, {}).upper()

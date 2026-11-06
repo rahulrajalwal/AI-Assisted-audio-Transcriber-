@@ -1,11 +1,15 @@
-"""TXT and PDF (fpdf2) exports for processed meetings."""
+"""TXT, PDF (fpdf2) and ZIP exports for processed meetings — every section downloadable."""
 
 from __future__ import annotations
 
+import io
+import json
 import re
 import unicodedata
+import zipfile
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
@@ -50,8 +54,84 @@ def _header_lines(record: MeetingRecord) -> list[str]:
     return lines
 
 
+def format_clock(seconds: Any) -> str:
+    """Seconds → "mm:ss" or "h:mm:ss"."""
+    try:
+        total = int(float(seconds))
+    except (TypeError, ValueError):
+        return ""
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
+def timestamped_paragraphs(record: MeetingRecord, window_seconds: float = 45.0) -> list[tuple[str, str]]:
+    """Split the transcript into readable paragraphs with a start timestamp each.
+
+    Uses the timed segments from Whisper/Sarvam when available (``[mm:ss]`` labels);
+    otherwise groups sentences, with an empty label.
+    """
+    transcript = record.transcript or ""
+    segments = [s for s in (record.segments or []) if "char_start" in s and "char_end" in s]
+    if not segments:
+        sentences = re.split(r"(?<=[.!?])\s+", transcript.strip())
+        return [("", " ".join(sentences[i : i + 5])) for i in range(0, len(sentences), 5) if sentences[i : i + 5]]
+    paragraphs: list[tuple[str, str]] = []
+    group_start, group_begin, group_end = None, 0, 0
+    for seg in segments:
+        if group_start is None:
+            group_start, group_begin = seg.get("start", 0.0), seg["char_start"]
+        group_end = seg["char_end"]
+        if seg.get("end", 0.0) - group_start >= window_seconds:
+            paragraphs.append((format_clock(group_start), transcript[group_begin:group_end].strip()))
+            group_start = None
+    if group_start is not None:
+        paragraphs.append((format_clock(group_start), transcript[group_begin:group_end].strip()))
+    return [(label, text) for label, text in paragraphs if text]
+
+
 def transcript_to_txt(record: MeetingRecord) -> str:
-    return "\n".join(_header_lines(record) + ["", "FULL TRANSCRIPT", "", record.transcript.strip(), ""])
+    """Full transcript, with [mm:ss] timestamps when available."""
+    paragraphs = timestamped_paragraphs(record)
+    if any(label for label, _ in paragraphs):
+        body = "\n\n".join(f"[{label}] {text}" for label, text in paragraphs)
+    else:
+        body = record.transcript.strip()
+    return "\n".join(_header_lines(record) + ["", "FULL TRANSCRIPT", "", body, ""])
+
+
+SECTIONS = {
+    "summary": ("MEETING SUMMARY", "summary"),
+    "action_items": ("ACTION ITEMS", "action_items"),
+    "key_decisions": ("KEY DECISIONS", "key_decisions"),
+    "open_questions": ("OPEN QUESTIONS", "open_questions"),
+}
+
+
+def section_to_txt(record: MeetingRecord, section: str) -> str:
+    """One section (summary, action_items, key_decisions, open_questions) as plain text."""
+    heading, attribute = SECTIONS[section]
+    content = _strip_markdown(getattr(record, attribute) or "").strip()
+    return "\n".join(_header_lines(record) + ["", heading, "-" * len(heading), content, ""])
+
+
+def chat_to_txt(record: MeetingRecord, messages: list[dict[str, Any]]) -> str:
+    """The Q&A conversation, with the sources each answer used."""
+    lines = _header_lines(record) + ["", "QUESTIONS & ANSWERS", "-" * 19]
+    number = 0
+    for message in messages:
+        if message.get("role") == "user":
+            number += 1
+            lines += ["", f"Q{number}: {message.get('content', '').strip()}"]
+        else:
+            lines += [f"A{number}: {_strip_markdown(message.get('content', '')).strip()}"]
+            for source in message.get("sources") or []:
+                when = format_clock(source.get("start_seconds")) if source.get("start_seconds") is not None else ""
+                label = f"   [Source {source.get('number')}] {source.get('title', '')}" + (f" @ {when}" if when else "")
+                lines.append(label)
+    if number == 0:
+        lines += ["", "No questions asked yet."]
+    return "\n".join(lines + [""])
 
 
 def summary_to_txt(record: MeetingRecord) -> str:
@@ -158,8 +238,10 @@ def _section(pdf: _ReportPDF, title: str, markdown: str) -> None:
     _write_markdown(pdf, markdown)
 
 
-def build_pdf_report(record: MeetingRecord, include_transcript: bool = True) -> bytes:
-    """Create a formatted PDF meeting report and return its bytes."""
+def build_pdf_report(
+    record: MeetingRecord, include_transcript: bool = True, chat: list[dict[str, Any]] | None = None
+) -> bytes:
+    """Create a formatted PDF meeting report (optionally with the Q&A chat) and return its bytes."""
     pdf = _ReportPDF(record.title)
     pdf.set_title(record.title)
     pdf.set_creator("AI Meeting Assistant")
@@ -187,6 +269,16 @@ def build_pdf_report(record: MeetingRecord, include_transcript: bool = True) -> 
     _section(pdf, "Key Decisions", record.key_decisions)
     _section(pdf, "Open Questions", record.open_questions)
 
+    if chat and any(m.get("role") == "user" for m in chat):
+        qa_lines, number = [], 0
+        for message in chat:
+            if message.get("role") == "user":
+                number += 1
+                qa_lines += ["", f"**Q{number}. {message.get('content', '').strip()}**"]
+            else:
+                qa_lines += [_strip_markdown(message.get("content", "")).strip()]
+        _section(pdf, "Questions & Answers", "\n".join(qa_lines).strip())
+
     if include_transcript:
         pdf.add_page()
         pdf.font("B", 13.5)
@@ -195,6 +287,28 @@ def build_pdf_report(record: MeetingRecord, include_transcript: bool = True) -> 
         pdf.ln(1)
         pdf.font("", 9.5)
         pdf.set_text_color(45, 45, 50)
-        pdf.multi_cell(0, 5, pdf.clean(record.transcript), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        for label, text in timestamped_paragraphs(record):
+            if label:
+                pdf.font("B", 9)
+                pdf.set_text_color(90, 90, 140)
+                pdf.cell(0, 5, label, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                pdf.font("", 9.5)
+                pdf.set_text_color(45, 45, 50)
+            pdf.multi_cell(0, 5, pdf.clean(text), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.ln(1.5)
 
     return bytes(pdf.output())
+
+
+def export_bundle(record: MeetingRecord, chat: list[dict[str, Any]] | None = None) -> bytes:
+    """Everything in one ZIP: transcript, each section, Q&A, PDF report and the raw JSON record."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as bundle:
+        bundle.writestr("transcript.txt", transcript_to_txt(record))
+        for section in SECTIONS:
+            bundle.writestr(f"{section}.txt", section_to_txt(record, section))
+        bundle.writestr("summary_all_sections.txt", summary_to_txt(record))
+        bundle.writestr("questions_and_answers.txt", chat_to_txt(record, chat or []))
+        bundle.writestr("meeting_report.pdf", build_pdf_report(record, chat=chat))
+        bundle.writestr("meeting.json", json.dumps(record.to_dict(), ensure_ascii=False, indent=2))
+    return buffer.getvalue()

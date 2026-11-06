@@ -3,30 +3,37 @@
 Stages (each reports real progress events through an optional callback):
 
 1. input          – input validation and audio extraction (yt-dlp / local file)
-2. audio          – conversion to mono 16 kHz WAV and chunking (FFmpeg + pydub)
-3. transcription  – Whisper (English) or Sarvam AI (Hinglish)
-4. analysis       – Gemini Map-Reduce summary and meeting title
-5. extraction     – action items, key decisions, open questions (Gemini)
-6. indexing       – Hugging Face embeddings → ChromaDB, ready for RAG
+2. audio          – conversion to mono 16 kHz WAV and AUDIO chunking (FFmpeg + pydub)
+3. transcription  – Whisper (English) or Sarvam AI (Hinglish), with timed segments
+4. analysis       – LLM (OpenRouter) Map-Reduce summary and meeting title
+5. extraction     – action items, key decisions, open questions
+6. indexing       – TEXT chunking → MiniLM embeddings → persistent ChromaDB (for RAG)
 
 A failure in any stage raises :class:`PipelineError`; nothing is reported as
 successful after a failed stage. If transcription succeeded, the error carries
-the transcript so the analysis can be retried without re-transcribing.
+the transcript (and timestamps) so the analysis can be retried without
+re-transcribing.
 """
 
 from __future__ import annotations
 
+import gc
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from core.extractor import extract_action_items, extract_key_decisions, extract_questions
-from core.llm import LLMError, get_model_name, is_llm_configured
+from core.llm import LLMError, ensure_llm_ready, get_model_name
 from core.meeting_store import MeetingRecord, load_meeting, save_meeting
 from core.summarizer import generate_title, summarize
-from core.transcriber import LANGUAGE_ENGINES, TranscriptionError, normalize_language, transcribe_all
+from core.transcriber import (
+    LANGUAGE_ENGINES,
+    TranscriptionError,
+    normalize_language,
+    transcribe_all_with_segments,
+)
 from core.vector_store import build_vector_store, compute_meeting_id
 from utils.audio_processor import (
     AudioProcessingError,
@@ -55,7 +62,7 @@ STAGES: tuple[Stage, ...] = (
     Stage("input", "Input validation & audio extraction"),
     Stage("audio", "Audio conversion & chunking"),
     Stage("transcription", "Speech-to-text transcription"),
-    Stage("analysis", "Gemini meeting analysis (summary & title)"),
+    Stage("analysis", "LLM meeting analysis (summary & title)"),
     Stage("extraction", "Information extraction (actions, decisions, questions)"),
     Stage("indexing", "Vector indexing & RAG initialisation"),
 )
@@ -81,12 +88,14 @@ class PipelineError(RuntimeError):
         *,
         transcript: str | None = None,
         duration_seconds: float | None = None,
+        segments: list[dict] | None = None,
     ):
         super().__init__(message)
         self.stage = stage
         self.stage_label = STAGE_LABELS.get(stage, stage)
         self.transcript = transcript
         self.duration_seconds = duration_seconds
+        self.segments = segments or []
 
 
 _EXPECTED_ERRORS = (AudioProcessingError, TranscriptionError, LLMError, ValueError)
@@ -116,8 +125,10 @@ def _run_stage(
     done_message: Callable[[Any], str] | str = "",
     transcript: str | None = None,
     duration_seconds: float | None = None,
+    segments: list[dict] | None = None,
 ) -> Any:
     _emit(progress, stage, "running", start_message, 0.0)
+    context = {"transcript": transcript, "duration_seconds": duration_seconds, "segments": segments}
     try:
         result = func()
     except PipelineError:
@@ -125,12 +136,16 @@ def _run_stage(
     except _EXPECTED_ERRORS as exc:
         message = str(exc)
         _emit(progress, stage, "error", message)
-        raise PipelineError(stage, message, transcript=transcript, duration_seconds=duration_seconds) from exc
+        raise PipelineError(stage, message, **context) from exc
+    except MemoryError as exc:
+        message = "The computer ran out of memory. Close other applications or use smaller models (see README)."
+        _emit(progress, stage, "error", message)
+        raise PipelineError(stage, message, **context) from exc
     except Exception as exc:
         logger.exception("Unexpected error in stage %s", stage)
         message = f"Unexpected error: {type(exc).__name__}: {exc}"
         _emit(progress, stage, "error", message)
-        raise PipelineError(stage, message, transcript=transcript, duration_seconds=duration_seconds) from exc
+        raise PipelineError(stage, message, **context) from exc
     text = done_message(result) if callable(done_message) else done_message
     _emit(progress, stage, "done", text, 1.0)
     return result
@@ -155,12 +170,16 @@ def validate_source(source: str) -> str:
     return source
 
 
+def infer_source_type(source: str) -> str:
+    return "youtube" if is_url(source) else "local_file"
+
+
 def transcribe_source(
     source: str,
     language: str,
     progress: ProgressCallback | None = None,
-) -> tuple[str, float | None]:
-    """Stages 1–3: return ``(transcript, duration_seconds)``. Temporary audio is always cleaned up."""
+) -> tuple[str, float | None, list[dict]]:
+    """Stages 1–3: return ``(transcript, duration_seconds, segments)``. Temporary audio is always deleted."""
     work_directory: Path | None = None
     try:
 
@@ -178,32 +197,32 @@ def transcribe_source(
             _emit(progress, "input", "running", f"Language: {lang} → {LANGUAGE_ENGINES[lang]}")
             return path
 
-        raw_path = _run_stage(
-            progress, "input", acquire,
-            start_message="Validating input",
-            done_message="Audio source ready",
-        )
+        raw_path = _run_stage(progress, "input", acquire, start_message="Validating input", done_message="Audio source ready")
 
         def prepare() -> tuple[list[str], float]:
             _emit(progress, "audio", "running", "Converting to mono 16 kHz WAV", 0.2)
             wav_path = convert_to_wav(raw_path, str(Path(work_directory) / "audio_16k_mono.wav"))
             duration = get_duration_seconds(wav_path)
             _emit(progress, "audio", "running", "Splitting audio into chunks", 0.7)
-            return chunk_audio(wav_path, output_dir=work_directory), duration
+            chunks = chunk_audio(wav_path, output_dir=work_directory)
+            gc.collect()  # drop decoded audio before the speech model loads
+            return chunks, duration
 
         chunks, duration = _run_stage(
             progress, "audio", prepare,
-            done_message=lambda r: f"{len(r[0])} chunk(s), {_format_duration(r[1])} of audio",
+            done_message=lambda r: f"{len(r[0])} audio chunk(s), {_format_duration(r[1])} of audio",
         )
 
-        transcript = _run_stage(
-            progress, "transcription",
-            lambda: transcribe_all(chunks, language, progress=_sub_progress(progress, "transcription")),
+        def transcribe() -> tuple[str, list[dict]]:
+            return transcribe_all_with_segments(chunks, language, progress=_sub_progress(progress, "transcription"))
+
+        transcript, segments = _run_stage(
+            progress, "transcription", transcribe,
             start_message=f"Starting {LANGUAGE_ENGINES.get(language.lower(), '')}",
-            done_message=lambda text: f"{len(text.split()):,} words transcribed",
+            done_message=lambda r: f"{len(r[0].split()):,} words transcribed",
             duration_seconds=duration,
         )
-        return transcript, duration
+        return transcript, duration, segments
     finally:
         cleanup_work_dir(work_directory)
 
@@ -212,14 +231,17 @@ def analyse_transcript(
     transcript: str,
     *,
     source: str = "",
+    source_type: str = "",
     language: str = "english",
     duration_seconds: float | None = None,
+    segments: list[dict] | None = None,
+    meeting_date: str = "",
     progress: ProgressCallback | None = None,
     force: bool = False,
 ) -> MeetingRecord:
-    """Stages 4–6: Gemini analysis, extraction and vector indexing."""
+    """Stages 4–6: LLM analysis, extraction and vector indexing."""
     transcript = (transcript or "").strip()
-    common = {"transcript": transcript, "duration_seconds": duration_seconds}
+    common = {"transcript": transcript, "duration_seconds": duration_seconds, "segments": segments}
     if not transcript:
         raise PipelineError("analysis", "The transcript is empty.", **common)
 
@@ -227,14 +249,15 @@ def analyse_transcript(
     record = None if force else load_meeting(meeting_id)
 
     if record is not None:
-        message = "Reused saved analysis for this meeting (no Gemini calls)"
+        message = "Reused saved analysis for this meeting (no LLM calls)"
         _emit(progress, "analysis", "done", message, 1.0)
         _emit(progress, "extraction", "done", message, 1.0)
     else:
-        if not is_llm_configured():
-            message = "Gemini API key not found. Add GOOGLE_API_KEY to .env and restart the app."
-            _emit(progress, "analysis", "error", message)
-            raise PipelineError("analysis", message, **common)
+        try:
+            ensure_llm_ready()  # OpenRouter key valid, model available, free quota left?
+        except LLMError as exc:
+            _emit(progress, "analysis", "error", str(exc))
+            raise PipelineError("analysis", str(exc), **common) from exc
 
         def analyse() -> tuple[str, str]:
             summary = summarize(transcript, progress=_sub_progress(progress, "analysis"))
@@ -243,7 +266,7 @@ def analyse_transcript(
 
         summary, title = _run_stage(
             progress, "analysis", analyse,
-            start_message=f"Summarising with {get_model_name()}",
+            start_message=f"Summarising with {get_model_name()} via OpenRouter",
             done_message=lambda r: f"Title: {r[1]}",
             **common,
         )
@@ -264,6 +287,7 @@ def analyse_transcript(
             **common,
         )
 
+        processed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         record = MeetingRecord(
             meeting_id=meeting_id,
             title=title,
@@ -274,11 +298,14 @@ def analyse_transcript(
             open_questions=questions,
             source=source,
             language=normalize_language(language),
-            processed_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            processed_at=processed_at,
             model=get_model_name(),
             duration_seconds=duration_seconds,
+            meeting_date=meeting_date or date.today().isoformat(),
+            source_type=source_type or infer_source_type(source),
+            segments=segments or [],
         )
-        # Saved before indexing so a retry after an indexing failure needs no Gemini calls.
+        # Saved before indexing so a retry after an indexing failure needs no LLM calls.
         save_meeting(record)
 
     final_record = record
@@ -289,11 +316,15 @@ def analyse_transcript(
             meeting_id=final_record.meeting_id,
             title=final_record.title,
             source=final_record.source,
+            source_type=final_record.source_type,
             language=final_record.language,
             processed_at=final_record.processed_at,
+            meeting_date=final_record.meeting_date,
+            segments=final_record.segments,
+            replace=force,  # intentional re-analysis refreshes this meeting's chunks only
         ),
-        start_message="Embedding transcript with all-MiniLM-L6-v2",
-        done_message="Transcript indexed in ChromaDB — ready for questions",
+        start_message="Splitting transcript into text chunks and embedding with all-MiniLM-L6-v2",
+        done_message="Transcript stored in ChromaDB — ready for questions",
         **common,
     )
     return record
@@ -305,15 +336,20 @@ def run_pipeline(
     progress: ProgressCallback | None = None,
     *,
     source_label: str | None = None,
+    source_type: str = "",
+    meeting_date: str = "",
     force: bool = False,
 ) -> MeetingRecord:
     """Run all six stages for a YouTube URL or local file path."""
-    transcript, duration = transcribe_source(source, language, progress)
+    transcript, duration, segments = transcribe_source(source, language, progress)
     return analyse_transcript(
         transcript,
         source=source_label or source,
+        source_type=source_type or infer_source_type(source),
         language=language,
         duration_seconds=duration,
+        segments=segments,
+        meeting_date=meeting_date,
         progress=progress,
         force=force,
     )

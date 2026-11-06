@@ -37,3 +37,6 @@ dist/
 
 # Local tool settings
 .claude/
+
+# Database backups
+backups/

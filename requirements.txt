@@ -1,21 +1,24 @@
 # ── AI Meeting Assistant ── requirements.txt ─────────────────────────────────────
 # Python 3.10+ (developed and tested on Python 3.11, Windows 11).
-# FFmpeg must be installed separately and available on PATH (see README).
-# Minimum versions below are the ones this project was tested with.
+# External programs (install separately, see README):
+#   * FFmpeg on PATH
+# LLM inference runs on OpenRouter (OPENROUTER_API_KEY in .env); nothing is run locally.
 
 # ── Audio / video acquisition & processing ─────────────────────────────────────
 yt-dlp>=2026.10.26                 # YouTube audio download
-pydub>=0.25.1                      # Conversion (mono 16 kHz) and chunking via FFmpeg
+pydub>=0.25.1                      # Conversion (mono 16 kHz) and audio chunking via FFmpeg
 
 # ── Speech-to-text ─────────────────────────────────────────────────────────────
 openai-whisper>=20250625           # Local Whisper (English)
 torch>=2.2.0                       # Whisper backend
 requests>=2.32.0                   # Sarvam AI REST API (Hinglish)
 
-# ── LLM orchestration: LangChain LCEL + Google Gemini ──────────────────────────
+# ── LLM orchestration: LangChain LCEL + OpenRouter (ACTIVE) ────────────────────
 langchain-core>=1.7.0
 langchain-text-splitters>=1.1.0
-langchain-google-genai>=4.4.3      # ChatGoogleGenerativeAI (gemini-3.8-flash support)
+langchain-openai>=1.7.0            # ChatOpenAI pointed at https://openrouter.ai/api/v1
+                                   # (langchain-openrouter needs pydantic<2.13, which conflicts with ChromaDB's deps)
+httpx>=0.27.0                      # OpenRouter key/model status checks
 
 # ── RAG: embeddings + vector store ─────────────────────────────────────────────
 langchain-huggingface>=1.2.0       # HuggingFaceEmbeddings
@@ -32,3 +35,8 @@ python-dotenv>=1.0.0
 
 # ── Testing ────────────────────────────────────────────────────────────────────
 pytest>=8.0.0
+
+# ── INACTIVE hosted LLM integrations (preserved in core/llm.py, not imported) ──
+# Install only if you re-enable one of them (see README → "Re-enabling Gemini or Mistral"):
+# langchain-google-genai>=4.4.3    # Google Gemini 3.8 Flash
+# langchain-mistralai>=1.1.0       # Mistral AI (original implementation)

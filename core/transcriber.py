@@ -80,7 +80,11 @@ def load_model():
     return _model
 
 
-def transcribe_chunk_whisper(chunk_path: str) -> str:
+Segment = dict  # {"start": float, "end": float, "text": str} — seconds, relative to the chunk
+
+
+def whisper_segments(chunk_path: str) -> list[Segment]:
+    """Transcribe one chunk with Whisper and return its timed segments."""
     import torch
 
     model = load_model()
@@ -91,7 +95,18 @@ def transcribe_chunk_whisper(chunk_path: str) -> str:
         fp16=torch.cuda.is_available(),
         verbose=None,  # no console progress bar
     )
-    return (result.get("text") or "").strip()
+    segments = [
+        {"start": float(seg["start"]), "end": float(seg["end"]), "text": seg["text"].strip()}
+        for seg in result.get("segments") or []
+        if seg.get("text", "").strip()
+    ]
+    if not segments and (result.get("text") or "").strip():
+        segments = [{"start": 0.0, "end": 0.0, "text": result["text"].strip()}]
+    return segments
+
+
+def transcribe_chunk_whisper(chunk_path: str) -> str:
+    return " ".join(seg["text"] for seg in whisper_segments(chunk_path)).strip()
 
 
 def _sarvam_config() -> tuple[str, str]:
@@ -152,14 +167,14 @@ def _send_to_sarvam(piece_path: str, api_key: str | None = None, model: str | No
     raise TranscriptionError("Sarvam AI transcription failed.")  # pragma: no cover
 
 
-def transcribe_chunk_sarvam(chunk_path: str) -> str:
-    """Split a chunk into ≤25s pieces, send each to Sarvam, join the transcripts."""
+def sarvam_segments(chunk_path: str) -> list[Segment]:
+    """Split a chunk into ≤25s pieces, send each to Sarvam; one timed segment per piece."""
     api_key, model = _sarvam_config()
     audio = AudioSegment.from_wav(chunk_path)
     piece_ms = SARVAM_PIECE_SECONDS * 1000
     total_pieces = max(1, (len(audio) + piece_ms - 1) // piece_ms)
 
-    texts: list[str] = []
+    segments: list[Segment] = []
     for index, start in enumerate(range(0, len(audio), piece_ms)):
         piece = audio[start : start + piece_ms]
         piece_path = f"{chunk_path}_sv_{index}.wav"
@@ -168,26 +183,49 @@ def transcribe_chunk_sarvam(chunk_path: str) -> str:
             logger.info("Sarvam piece %d/%d", index + 1, total_pieces)
             text = _send_to_sarvam(piece_path, api_key, model)
             if text:
-                texts.append(text)
+                segments.append({"start": start / 1000, "end": (start + len(piece)) / 1000, "text": text})
         finally:
             if os.path.exists(piece_path):
                 os.remove(piece_path)
-    return " ".join(texts).strip()
+    del audio  # free the decoded chunk promptly
+    return segments
+
+
+def transcribe_chunk_sarvam(chunk_path: str) -> str:
+    return " ".join(seg["text"] for seg in sarvam_segments(chunk_path)).strip()
+
+
+def transcribe_chunk_segments(chunk_path: str, language: str = "english") -> list[Segment]:
+    """Route one chunk to Whisper (english) or Sarvam (hinglish); return timed segments."""
+    if normalize_language(language) == "hinglish":
+        return sarvam_segments(chunk_path)
+    return whisper_segments(chunk_path)
 
 
 def transcribe_chunk(chunk_path: str, language: str = "english") -> str:
-    """Route one chunk to Whisper (english) or Sarvam (hinglish)."""
-    if normalize_language(language) == "hinglish":
-        return transcribe_chunk_sarvam(chunk_path)
-    return transcribe_chunk_whisper(chunk_path)
+    """Route one chunk to Whisper (english) or Sarvam (hinglish); return plain text."""
+    return " ".join(seg["text"] for seg in transcribe_chunk_segments(chunk_path, language)).strip()
 
 
-def transcribe_all(
+def _chunk_duration_seconds(chunk_path: str) -> float:
+    try:
+        return len(AudioSegment.from_wav(chunk_path)) / 1000.0
+    except Exception:
+        return 0.0
+
+
+def transcribe_all_with_segments(
     chunks: list[str],
     language: str = "english",
     progress: ProgressFn | None = None,
-) -> str:
-    """Transcribe all chunks in order and return the full transcript."""
+) -> tuple[str, list[dict]]:
+    """Transcribe all audio chunks in order.
+
+    Returns ``(transcript, segments)`` where each segment has meeting-relative
+    ``start``/``end`` seconds, its ``audio_chunk`` index and its ``char_start``/
+    ``char_end`` position in the transcript — used to timestamp the text chunks
+    stored in ChromaDB.
+    """
     language = normalize_language(language)
     if not chunks:
         raise TranscriptionError("No audio chunks to transcribe.")
@@ -200,25 +238,51 @@ def transcribe_all(
     else:
         _sarvam_config()  # fail fast if the key is missing
 
-    parts: list[str] = []
+    transcript_parts: list[str] = []
+    segments: list[dict] = []
+    cursor = 0  # character position in the joined transcript
+    offset = 0.0  # seconds from the start of the meeting
     for index, chunk in enumerate(chunks):
         if progress:
             progress(f"{engine}: transcribing part {index + 1}/{len(chunks)}", index / len(chunks))
         try:
-            text = transcribe_chunk(chunk, language=language)
+            chunk_segments = transcribe_chunk_segments(chunk, language=language)
         except TranscriptionError:
             raise
         except Exception as exc:
-            raise TranscriptionError(
-                f"{engine} failed on audio part {index + 1}/{len(chunks)}: {exc}"
-            ) from exc
-        if text:
-            parts.append(text)
+            raise TranscriptionError(f"{engine} failed on audio part {index + 1}/{len(chunks)}: {exc}") from exc
+        for seg in chunk_segments:
+            text = seg["text"].strip()
+            if not text:
+                continue
+            if transcript_parts:
+                cursor += 1  # the joining space
+            segments.append(
+                {
+                    "start": round(offset + seg["start"], 2),
+                    "end": round(offset + seg["end"], 2),
+                    "audio_chunk": index,
+                    "char_start": cursor,
+                    "char_end": cursor + len(text),
+                }
+            )
+            transcript_parts.append(text)
+            cursor += len(text)
+        offset += _chunk_duration_seconds(chunk)
 
-    transcript = " ".join(parts).strip()
+    transcript = " ".join(transcript_parts).strip()
     if not transcript:
         raise TranscriptionError(
             "No speech was detected in the audio. Check that the recording contains audible speech "
             "and that the correct language was selected."
         )
-    return transcript
+    return transcript, segments
+
+
+def transcribe_all(
+    chunks: list[str],
+    language: str = "english",
+    progress: ProgressFn | None = None,
+) -> str:
+    """Transcribe all chunks in order and return the full transcript."""
+    return transcribe_all_with_segments(chunks, language, progress)[0]

@@ -1,9 +1,12 @@
-"""Action-item, key-decision and open-question extraction with Gemini (LangChain LCEL).
+"""Action-item, key-decision and open-question extraction (LangChain LCEL).
 
-Each extraction keeps its own chain and prompt. Transcripts up to
-``EXTRACTION_SINGLE_PASS_MAX_CHARS`` are processed in one request; longer ones
-are split, extracted per section and then consolidated (deduplicated) in a
-final request, so no single request grows without bound.
+The chat model comes from ``core.llm`` (active provider: OpenRouter, model from OPENROUTER_MODEL;
+Gemini and Mistral are preserved there in an inactive section).
+
+Each extraction keeps its own chain and prompt. A transcript that fits the model's
+context budget is processed in one request; longer ones are split, extracted per
+section (sequentially) and then consolidated (deduplicated), so no request ever
+exceeds the context window and no part of the transcript is skipped.
 """
 
 from __future__ import annotations
@@ -14,12 +17,13 @@ from typing import Callable
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable, RunnableLambda, RunnablePassthrough
 
-from core.llm import build_text_chain, invoke_with_retry
-from core.summarizer import split_transcript
+from core.llm import build_text_chain, input_char_budget, invoke_with_retry
+from core.summarizer import collapse_summaries, split_transcript
 
-EXTRACTION_SINGLE_PASS_MAX_CHARS = 150_000  # ≈37k tokens ≈ 3+ hours of speech
-EXTRACTION_CHUNK_CHARS = 100_000
-EXTRACTION_CHUNK_OVERLAP = 2_000
+# ``None`` = derive from the model's context window (core.llm.input_char_budget).
+EXTRACTION_SINGLE_PASS_MAX_CHARS: int | None = None
+EXTRACTION_CHUNK_CHARS: int | None = None
+EXTRACTION_CHUNK_OVERLAP = 300
 
 NO_ACTION_ITEMS = "No action items found."
 NO_KEY_DECISIONS = "No key decisions found."
@@ -30,6 +34,7 @@ ProgressFn = Callable[[str, float | None], None]
 _RULES = """Rules:
 - Use ONLY what is stated in the transcript. Never invent people, owners, deadlines, numbers or outcomes.
 - Never guess missing details; follow the format instructions below for how to show them.
+- Keep dates and deadlines exactly as said (e.g. "Wednesday", "the fourteenth"); never add months, years or calendar dates.
 - Do not repeat the same item twice; merge duplicates.
 - Output only the requested list — no introduction or closing remarks."""
 
@@ -127,11 +132,12 @@ def _extract(
         raise ValueError("Cannot extract information from an empty transcript.")
 
     chain = build_chain(system_prompt)
-    if len(text) <= EXTRACTION_SINGLE_PASS_MAX_CHARS:
+    budget = input_char_budget(reserve_tokens=150)  # extraction prompts are longer
+    if len(text) <= (EXTRACTION_SINGLE_PASS_MAX_CHARS or budget):
         result = invoke_with_retry(chain, text, task=task)
         return empty_message if _is_empty_result(result, empty_message) else result
 
-    sections = split_transcript(text, EXTRACTION_CHUNK_CHARS, EXTRACTION_CHUNK_OVERLAP)
+    sections = split_transcript(text, EXTRACTION_CHUNK_CHARS or int(budget * 0.9), EXTRACTION_CHUNK_OVERLAP)
     partial_results: list[str] = []
     for index, section in enumerate(sections, start=1):
         if progress:
@@ -144,12 +150,18 @@ def _extract(
         return empty_message
     if len(partial_results) == 1:
         return partial_results[0]
-    combined = "\n\n---\n\n".join(
-        f"List from section {i}:\n{result}" for i, result in enumerate(partial_results, start=1)
-    )
-    consolidated = invoke_with_retry(
-        _build_consolidate_chain(kind, empty_message), combined, task=f"{task} (consolidation)"
-    )
+    consolidate_chain = _build_consolidate_chain(kind, empty_message)
+
+    def consolidate(block: str) -> str:
+        return invoke_with_retry(consolidate_chain, block, task=f"{task} (consolidation)")
+
+    # Hierarchical: merge groups of lists that fit the context budget, until one remains.
+    lists = collapse_summaries(partial_results, consolidate, max_chars=budget)
+    if len(lists) > 1:
+        lists = [consolidate("\n\n---\n\n".join(
+            f"List from section {i}:\n{result}" for i, result in enumerate(lists, start=1)
+        ))]
+    consolidated = lists[0]
     return empty_message if _is_empty_result(consolidated, empty_message) else consolidated
 
 

@@ -36,7 +36,7 @@ def test_analyse_transcript_full_flow(fake_llm, fake_embeddings):
     assert record.summary.startswith("### Overview")
     assert "Priya" in record.action_items
     assert record.key_decisions == "1. **Launch on 15 August**"
-    assert record.model == "gemini-3.8-flash"
+    assert record.model == "openai/gpt-4o-mini"
     assert len(llm.calls) == 5  # summary, title, 3 extractions
 
     finished = [(e.stage, e.status) for e in events if e.status != "running"]
@@ -81,12 +81,20 @@ def test_failed_extraction_is_not_reported_as_success(fake_llm, fake_embeddings)
     assert load_meeting(compute_meeting_id(SAMPLE_TRANSCRIPT)) is None
 
 
-def test_missing_api_key_stops_before_analysis(monkeypatch, fake_embeddings):
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    with pytest.raises(PipelineError, match="GOOGLE_API_KEY") as info:
-        analyse_transcript(SAMPLE_TRANSCRIPT)
+def test_openrouter_unreachable_stops_before_analysis(llm_down, fake_embeddings):
+    with pytest.raises(PipelineError, match="Could not reach OpenRouter") as info:
+        analyse_transcript(SAMPLE_TRANSCRIPT, segments=[{"start": 0, "end": 1, "char_start": 0, "char_end": 5}])
     assert info.value.stage == "analysis"
+    assert info.value.transcript == SAMPLE_TRANSCRIPT and info.value.segments  # retry keeps timestamps
+
+
+def test_force_reanalysis_refreshes_only_this_meetings_chunks(fake_llm, fake_embeddings):
+    fake_llm(scripted_reply)
+    analyse_transcript(SAMPLE_TRANSCRIPT)
+    analyse_transcript("A different meeting about the office move. We agreed to move in June.")
+    before = len(load_vector_store().get(include=[])["ids"])
+    analyse_transcript(SAMPLE_TRANSCRIPT, force=True)
+    assert len(load_vector_store().get(include=[])["ids"]) == before
 
 
 def test_missing_file_fails_in_input_stage(tmp_path):
@@ -109,16 +117,36 @@ def test_run_pipeline_with_mocked_transcription(fake_llm, fake_embeddings, monke
 
     audio = tmp_path / "meeting.mp3"
     Sine(440).to_audio_segment(duration=2_000).export(audio, format="mp3")
-    monkeypatch.setattr(pipeline, "transcribe_all", lambda chunks, language, progress=None: SAMPLE_TRANSCRIPT)
+    segments = [{"start": 0.0, "end": 2.0, "audio_chunk": 0, "char_start": 0, "char_end": len(SAMPLE_TRANSCRIPT)}]
+    monkeypatch.setattr(
+        pipeline, "transcribe_all_with_segments", lambda chunks, language, progress=None: (SAMPLE_TRANSCRIPT, segments)
+    )
     fake_llm(scripted_reply)
 
     events = []
-    record = run_pipeline(str(audio), "english", progress=events.append, source_label="meeting.mp3")
+    record = run_pipeline(
+        str(audio), "english", progress=events.append, source_label="meeting.mp3", meeting_date="2026-03-10"
+    )
     done = [e.stage for e in events if e.status == "done"]
     assert done == ["input", "audio", "transcription", "analysis", "extraction", "indexing"]
-    assert record.source == "meeting.mp3"
+    assert record.source == "meeting.mp3" and record.source_type == "local_file"
+    assert record.meeting_date == "2026-03-10" and record.segments == segments
+    meta = load_vector_store().get(where={"meeting_id": record.meeting_id}, include=["metadatas"])["metadatas"]
+    assert meta and meta[0]["meeting_date"] == "2026-03-10" and meta[0]["start_seconds"] == 0.0
     assert record.duration_seconds and 1.5 < record.duration_seconds < 2.5
     # temporary audio is cleaned up
     from core.config import work_dir
 
     assert not any(work_dir().glob("run_*"))
+
+
+def test_chat_history_saved_per_meeting():
+    from core.meeting_store import load_chats, save_chats
+
+    meeting_id = "a" * 16
+    assert load_chats(meeting_id) == {}
+    save_chats(meeting_id, {"This meeting": [{"role": "user", "content": "hi"}]})
+    assert load_chats(meeting_id)["This meeting"][0]["content"] == "hi"
+    from core.meeting_store import list_meetings
+
+    assert list_meetings() == []  # chat files are never mistaken for meetings
