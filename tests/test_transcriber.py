@@ -160,3 +160,13 @@ def test_sarvam_auth_error_not_retried(monkeypatch, wav_60s):
     with pytest.raises(tr.TranscriptionError, match="rejected"):
         tr._send_to_sarvam(wav_60s, "k", "m")
     assert len(calls) == 1
+
+
+def test_sarvam_no_credits_is_explained_and_not_retried(monkeypatch, wav_60s):
+    """Seen on Streamlit Cloud: HTTP 402 "No credits available" must tell the user what to do."""
+    calls = []
+    body = {"error": {"message": "No credits available.", "code": "insufficient_quota_error"}}
+    monkeypatch.setattr(tr.requests, "post", lambda *a, **k: calls.append(1) or FakeResponse(402, body))
+    with pytest.raises(tr.TranscriptionError, match="no credits left.*dashboard.sarvam.ai.*Resume"):
+        tr._send_to_sarvam(wav_60s, "k", "m")
+    assert len(calls) == 1

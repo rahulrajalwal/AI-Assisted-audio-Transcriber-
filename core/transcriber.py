@@ -163,6 +163,7 @@ def _send_to_sarvam(piece_path: str, api_key: str | None = None, model: str | No
 
         hint = {
             401: "the SARVAM_API_KEY was rejected",
+            402: "your Sarvam AI account has no credits left — add credits at https://dashboard.sarvam.ai, then click Resume",
             403: "the SARVAM_API_KEY is not allowed to use this model",
             429: "the Sarvam rate limit / credits are exhausted",
         }.get(response.status_code, "the request failed")

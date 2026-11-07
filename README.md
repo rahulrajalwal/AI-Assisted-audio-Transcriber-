@@ -349,6 +349,8 @@ The earlier hosted integrations are preserved, commented out, at the bottom of `
 | `SARVAM_API_KEY is not set` | Needed only for Hindi/Hinglish; add it to `.env` |
 | Processing stopped halfway (network, rate limit, app closed) | Click **Resume processing**, or **Resume: …** under *Unfinished* in the sidebar. Finished audio parts and AI steps are reused |
 | Sarvam `HTTP 429` on long Hinglish recordings | Lower `SARVAM_CONCURRENCY` to `1`, then resume |
+| Sarvam `HTTP 402` "No credits available" | The Sarvam AI account has run out of credits. Add credits at https://dashboard.sarvam.ai, then click **Resume** (finished parts are kept) |
+| YouTube: `HTTP 403` or "Sign in to confirm you're not a bot" on Streamlit Cloud | YouTube is blocking the cloud server. Upload the file instead, run locally, or add `YOUTUBE_COOKIES` (see *YouTube links on Streamlit Community Cloud*) |
 | Whisper is slow | Use `WHISPER_MODEL=base` |
 | `ModuleNotFoundError` when starting the app | The `.venv` folder was moved, so its `.exe` launchers point to the old location. Use `python -m streamlit run app.py`, or repair with `python -m pip install --force-reinstall --no-deps streamlit==1.66.1` |
 | `WinError 1450` in the Streamlit log | Already handled by `.streamlit/config.toml` (`folderWatchBlacklist`) |
