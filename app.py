@@ -419,6 +419,7 @@ def render_sidebar(meetings: list[MeetingRecord], busy: bool) -> None:
             ("Sarvam API key", sarvam_configured(), "configured", "missing"),
             ("FFmpeg", bool(shutil.which("ffmpeg")), "found", "not found"),
             ("Deno (YouTube downloads)", deno_available(), "found", "not found"),
+            ("YouTube cookies", bool(os.getenv("YOUTUBE_COOKIES", "").strip()), "set", "not set (optional)"),
         ]
         html_rows = "".join(
             f'<div class="status-row"><span>{name}</span>'

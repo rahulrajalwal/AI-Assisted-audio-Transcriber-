@@ -232,7 +232,7 @@ def test_youtube_403_everywhere_gives_actionable_error(monkeypatch, tmp_path):
 
     attempts: list = []
     monkeypatch.setattr(yt_dlp, "YoutubeDL", _client_ydl(attempts, set(ap.YOUTUBE_FALLBACK_CLIENTS), tmp_path))
-    with pytest.raises(ap.AudioProcessingError, match="403.*Deno.*upload the audio or video file"):
+    with pytest.raises(ap.AudioProcessingError, match="403.*refusing downloads from this server.*YOUTUBE_COOKIES"):
         ap.download_youtube_audio("https://youtu.be/abc123", tmp_path)
     assert attempts == list(ap.YOUTUBE_FALLBACK_CLIENTS)
 
@@ -261,3 +261,79 @@ def test_youtube_non_403_error_is_not_retried(monkeypatch, tmp_path):
     with pytest.raises(ap.AudioProcessingError, match="Private video"):
         ap.download_youtube_audio("https://youtu.be/abc123", tmp_path)
     assert calls == [1]
+
+
+@requires_ffmpeg
+def test_youtube_bot_check_also_tries_other_clients(monkeypatch, tmp_path):
+    """Streamlit Cloud: "Sign in to confirm you're not a bot" for some clients — the next ones are tried."""
+    import yt_dlp
+
+    attempts: list = []
+
+    class BotCheckYDL:
+        def __init__(self, opts):
+            self.client = (opts.get("extractor_args") or {}).get("youtube", {}).get("player_client", [None])[0]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, url, download):
+            attempts.append(self.client)
+            if self.client in (None, "tv_simply"):
+                raise yt_dlp.utils.DownloadError(
+                    "ERROR: [youtube] abc123: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies"
+                )
+            (tmp_path / "abc123.m4a").write_bytes(b"audio")
+            return {"id": "abc123", "ext": "m4a"}
+
+        def prepare_filename(self, info):
+            return str(tmp_path / "abc123.m4a")
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", BotCheckYDL)
+    assert ap.download_youtube_audio("https://youtu.be/abc123", tmp_path).endswith("abc123.m4a")
+    assert attempts == [None, "tv_simply", "tv"]
+
+
+def test_bot_check_message_gives_options_not_cli_flags():
+    message = ap._youtube_error(Exception(
+        "ERROR: [youtube] x: Sign in to confirm you’re not a bot. This helps protect our community. "
+        "Use --cookies-from-browser or --cookies for the authentication."
+    ))
+    assert "--cookies" not in message and "Upload the audio/video file" in message and "YOUTUBE_COOKIES" in message
+
+
+@requires_ffmpeg
+def test_youtube_cookies_secret_is_passed_to_yt_dlp(monkeypatch, tmp_path):
+    import yt_dlp
+
+    seen = []
+
+    class CookieYDL:
+        def __init__(self, opts):
+            seen.append(opts.get("cookiefile"))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, url, download):
+            (tmp_path / "abc123.m4a").write_bytes(b"audio")
+            return {"id": "abc123", "ext": "m4a", "title": "T"}
+
+        def prepare_filename(self, info):
+            return str(tmp_path / "abc123.m4a")
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", CookieYDL)
+    monkeypatch.delenv("YOUTUBE_COOKIES", raising=False)
+    ap.download_youtube_audio("https://youtu.be/abc123", tmp_path)
+    assert seen == [None]  # no secret → no cookie file
+
+    monkeypatch.setenv("YOUTUBE_COOKIES", "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tx")
+    ap.fetch_youtube_info("https://youtu.be/abc123")
+    ap.download_youtube_audio("https://youtu.be/abc123", tmp_path)
+    assert seen[1] == seen[2] and Path(seen[1]).read_text(encoding="utf-8").startswith("# Netscape HTTP Cookie File")

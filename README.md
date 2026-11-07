@@ -263,7 +263,7 @@ Processing time depends mostly on Whisper on your CPU. Use `WHISPER_MODEL=base` 
 | Recording | Result |
 |---|---|
 | Hinglish, 2 h 01 min (Sarvam) | **Complete end to end.** 13 parts. A network failure was simulated at part 10; **Resume** transcribed only parts 10–13 and reused the download and the chunk files. ~25 s per 10-minute part (2 parallel requests). 24,005 words, timestamps up to 2:01:04, 189 vector chunks, original YouTube title kept |
-| English, 2 h 26 min (Whisper `small`) | 15 parts. Failure simulated at part 10; resume continued from part 10 and finished parts 10–11 before the test was stopped (the run was not completed end to end). Whisper `small` took 4.5–7.5 min per 10-minute part (~0.45–0.75× real time) and ~1.2 GB of RAM. A full 2.5-hour English recording therefore takes roughly 1.5–2 hours on this PC |
+| English, 2 h 26 min (Whisper `small`) | **Complete end to end.** 15 parts. A network failure was simulated at part 10, and the process was later killed during part 12. Each resume continued from the first unfinished part, and no part was transcribed twice. Whisper `small` took 4.3–7.5 min per 10-minute part (~85 min in total, ~0.58× real time); peak RAM was 1.45 GB. 23,910 words, 2,059 timestamped segments up to 2:25:51, 187 vector chunks, original YouTube title kept |
 | Questions about the 2-hour meeting | Answers came only from that meeting, with timestamps (e.g. `[Source 2, ~10:34]`). A question about another stored meeting returned "not found" unless **All meetings** was chosen |
 
 ## Deploying on Streamlit Community Cloud
@@ -279,6 +279,34 @@ It works for short recordings, but it is **not suitable for long recordings**. P
 | Storage | The disk is **ephemeral**: `vector_db/`, `data/meetings/` and checkpoints are lost on every restart or redeploy. Persistent history needs an external database |
 
 Hinglish (Sarvam) is lighter, because transcription runs on Sarvam's servers. For long English meetings, run the app locally.
+
+### YouTube links on Streamlit Community Cloud
+
+YouTube often refuses downloads from cloud servers. It answers `HTTP Error 403: Forbidden` or *"Sign in to confirm you're not a bot"*, because the app runs on a shared data-centre IP. On your own computer the same links work.
+
+What the app does about it:
+
+- `yt-dlp[default,deno]` installs **Deno** and the challenge solver that yt-dlp needs for YouTube's main player clients. *System status* shows whether Deno was found.
+- If YouTube refuses a download, the app retries with several other player clients before giving up.
+
+If YouTube still refuses (tested on 8 Nov 2026: Streamlit Cloud got the bot check for every video):
+
+1. **Upload the file** instead of the link (*Upload file*). This always works.
+2. **Run the app on your own computer** for YouTube links.
+3. **Optional: YouTube cookies.** This is yt-dlp's documented workaround.
+   - Use a **separate Google account**, not your main one: YouTube may flag accounts used this way.
+   - Open a private/incognito window and sign in to YouTube with it.
+   - Export the youtube.com cookies in Netscape `cookies.txt` format (e.g. with a "Get cookies.txt LOCALLY" browser extension), then close the window without signing out.
+   - In Streamlit **Settings → Secrets**, add the whole file as a multi-line value:
+
+   ```toml
+   YOUTUBE_COOKIES = """
+   # Netscape HTTP Cookie File
+   ...paste the exported lines here...
+   """
+   ```
+
+   *System status* then shows *YouTube cookies: set*. Cookies expire, so re-export them if the bot check returns. The app writes them only to a private file for yt-dlp and never shows or logs them. Never commit cookies to GitHub.
 
 ## Running the tests
 

@@ -12,6 +12,7 @@ not split between chunks.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -117,12 +118,12 @@ def fetch_youtube_info(url: str) -> dict:
     import yt_dlp
 
     url = validate_youtube_url(url)
+    options = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True, **youtube_cookie_options()}
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}) as ydl:
+        with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:  # yt_dlp.utils.DownloadError and friends
-        message = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))
-        raise AudioProcessingError(f"Could not read the YouTube video: {message}") from exc
+        raise AudioProcessingError(f"Could not read the YouTube video: {_youtube_error(exc)}") from exc
     return {
         "id": info.get("id", ""),
         "title": info.get("title") or "",
@@ -131,14 +132,44 @@ def fetch_youtube_info(url: str) -> dict:
     }
 
 
-# YouTube player clients tried, in order, when YouTube refuses a download with HTTP 403 — common on
-# cloud servers (e.g. Streamlit Community Cloud), where it blocks some clients for data-centre IPs.
-# ``None`` = yt-dlp's own default clients.
-YOUTUBE_FALLBACK_CLIENTS: tuple[str | None, ...] = (None, "tv_simply", "tv", "web_safari", "mweb", "android_vr")
+# YouTube player clients tried, in order, when YouTube refuses a download (HTTP 403 or "Sign in to
+# confirm you're not a bot") — common on cloud servers such as Streamlit Community Cloud, whose
+# data-centre IPs YouTube treats with suspicion. ``None`` = yt-dlp's own default clients.
+YOUTUBE_FALLBACK_CLIENTS: tuple[str | None, ...] = (
+    None, "tv_simply", "tv", "web_embedded", "web_safari", "mweb", "android_vr", "ios",
+)
+_REFUSAL_MARKERS = ("403", "not a bot", "Sign in to confirm")
+YOUTUBE_BLOCKED_HINT = (
+    "YouTube is refusing downloads from this server — common on cloud hosts such as Streamlit Community "
+    "Cloud. Upload the audio/video file instead, run the app on your own computer, or add a YOUTUBE_COOKIES "
+    "secret (see README → YouTube links on Streamlit Community Cloud)."
+)
+
+
+def youtube_cookie_options() -> dict:
+    """Optional ``YOUTUBE_COOKIES`` (contents of a Netscape cookies.txt): passes YouTube's bot check on servers.
+
+    The value is written to a private file in the work directory for yt-dlp; it is never logged or shown.
+    """
+    text = os.getenv("YOUTUBE_COOKIES", "").strip()
+    if not text:
+        return {}
+    path = work_dir() / "youtube_cookies.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text + "\n", encoding="utf-8")
+    return {"cookiefile": str(path)}
+
+
+def _youtube_error(exc: Exception) -> str:
+    """yt-dlp's message without colour codes; refusals get practical advice instead of CLI flags."""
+    message = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))
+    if any(marker in message for marker in _REFUSAL_MARKERS):
+        message = message.split(" Use --cookies")[0].rstrip(". ") + ". " + YOUTUBE_BLOCKED_HINT
+    return message
 
 
 def _download_with_fallback(yt_dlp, url: str, ydl_opts: dict, output_dir: Path) -> tuple[dict, Path]:
-    """Download with yt-dlp's default clients; on HTTP 403 retry with other player clients."""
+    """Download with yt-dlp's default clients; if YouTube refuses, retry with other player clients."""
     error: Exception | None = None
     for client in YOUTUBE_FALLBACK_CLIENTS:
         options = dict(ydl_opts)
@@ -154,9 +185,9 @@ def _download_with_fallback(yt_dlp, url: str, ydl_opts: dict, output_dir: Path) 
                 return info, Path(ydl.prepare_filename(info))
         except Exception as exc:
             error = exc
-            if "403" not in str(exc):
+            if not any(marker in str(exc) for marker in _REFUSAL_MARKERS):
                 raise  # not a refusal (e.g. private video, network down): retrying won't help
-            logger.warning("YouTube refused the download (HTTP 403) with client %s; trying the next.", client or "default")
+            logger.warning("YouTube refused the download with client %s; trying the next.", client or "default")
     raise error  # every client was refused
 
 
@@ -179,18 +210,12 @@ def download_youtube_audio(url: str, output_dir: str | Path | None = None) -> st
         "retries": 5,
         "fragment_retries": 5,
         "continuedl": True,  # resume a partially downloaded file after a failure
+        **youtube_cookie_options(),
     }
     try:
         info, downloaded = _download_with_fallback(yt_dlp, url, ydl_opts, output_dir)
     except Exception as exc:  # yt_dlp.utils.DownloadError and friends
-        message = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))
-        if "403" in message:
-            message += (
-                ". YouTube refused the download. Check that Deno is installed (yt-dlp[default,deno] in "
-                "requirements.txt; see System status). If it is, YouTube may be blocking this server — "
-                "upload the audio or video file instead."
-            )
-        raise AudioProcessingError(f"Could not download the YouTube audio: {message}") from exc
+        raise AudioProcessingError(f"Could not download the YouTube audio: {_youtube_error(exc)}") from exc
 
     if not downloaded.exists():
         candidates = [c for c in sorted(output_dir.glob(f"{info.get('id', '*')}.*")) if not c.name.endswith(".part")]
