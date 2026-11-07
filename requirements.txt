@@ -7,6 +7,7 @@
 # ── Audio / video acquisition & processing ─────────────────────────────────────
 yt-dlp>=2026.10.26                 # YouTube audio download
 pydub>=0.25.1                      # Conversion (mono 16 kHz) and audio chunking via FFmpeg
+audioop-lts>=0.2.2; python_version >= "3.13"  # pydub needs `audioop`, removed from Python 3.13+ (e.g. Streamlit Cloud's 3.14)
 
 # ── Speech-to-text ─────────────────────────────────────────────────────────────
 openai-whisper>=20250625           # Local Whisper (English)
