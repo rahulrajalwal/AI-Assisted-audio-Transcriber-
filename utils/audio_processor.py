@@ -1,17 +1,22 @@
 """Audio acquisition and preparation: yt-dlp (YouTube), FFmpeg + pydub (conversion/chunking).
 
 Every input — a YouTube URL or a local audio/video file — ends up as mono,
-16 kHz WAV chunks (default 10 minutes each) inside a working directory that
-the caller can delete once transcription is finished.
+16 kHz WAV chunks (about 10 minutes each) inside a working directory.
+
+Long recordings (2 h+): conversion is streamed by FFmpeg straight to a 16 kHz mono
+WAV (≈ 115 MB per hour) instead of decoding the whole file into Python memory, and
+chunk boundaries are placed at the quietest moment near each cut point so words are
+not split between chunks.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import re
 import shutil
+import subprocess
 import uuid
+import wave
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
@@ -25,6 +30,7 @@ logger = logging.getLogger(__name__)
 TARGET_SAMPLE_RATE = 16_000
 TARGET_CHANNELS = 1
 DEFAULT_CHUNK_MINUTES = 10
+CUT_SEARCH_WINDOW_MS = 30_000  # look this far either side of a chunk boundary for silence
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma", ".amr"}
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".wmv", ".flv", ".mpeg", ".mpg", ".3gp"}
@@ -106,8 +112,27 @@ def cleanup_work_dir(path: str | Path | None) -> None:
 # ── Download / conversion / chunking ────────────────────────────────────────────
 
 
+def fetch_youtube_info(url: str) -> dict:
+    """Video metadata (id, original title, duration) without downloading anything."""
+    import yt_dlp
+
+    url = validate_youtube_url(url)
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:  # yt_dlp.utils.DownloadError and friends
+        message = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))
+        raise AudioProcessingError(f"Could not read the YouTube video: {message}") from exc
+    return {
+        "id": info.get("id", ""),
+        "title": info.get("title") or "",
+        "duration": info.get("duration"),
+        "url": info.get("webpage_url") or url,
+    }
+
+
 def download_youtube_audio(url: str, output_dir: str | Path | None = None) -> str:
-    """Download the best audio stream and extract it to WAV with FFmpeg."""
+    """Download the best audio stream as-is (m4a/webm); conversion happens in convert_to_wav."""
     import yt_dlp
 
     url = validate_youtube_url(url)
@@ -118,11 +143,13 @@ def download_youtube_audio(url: str, output_dir: str | Path | None = None) -> st
         "format": "bestaudio/best",
         # Video ID as the filename: avoids Windows-illegal characters from titles.
         "outtmpl": str(output_dir / "%(id)s.%(ext)s"),
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}],
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
+        "retries": 5,
+        "fragment_retries": 5,
+        "continuedl": True,  # resume a partially downloaded file after a failure
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -132,31 +159,54 @@ def download_youtube_audio(url: str, output_dir: str | Path | None = None) -> st
         message = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))
         raise AudioProcessingError(f"Could not download the YouTube audio: {message}") from exc
 
-    wav_path = downloaded.with_suffix(".wav")
-    if not wav_path.exists():
-        candidates = sorted(output_dir.glob(f"{info.get('id', '*')}*.wav"))
+    if not downloaded.exists():
+        candidates = [c for c in sorted(output_dir.glob(f"{info.get('id', '*')}.*")) if not c.name.endswith(".part")]
         if not candidates:
-            raise AudioProcessingError("The download finished but no WAV file was produced.")
-        wav_path = candidates[0]
-    return str(wav_path)
+            raise AudioProcessingError("The download finished but no audio file was produced.")
+        downloaded = candidates[0]
+    return str(downloaded)
 
 
 def convert_to_wav(input_path: str, output_path: str | None = None) -> str:
-    """Convert any audio/video file to mono 16 kHz WAV using pydub/FFmpeg."""
+    """Convert any audio/video file to mono 16 kHz WAV, streamed by FFmpeg (low memory)."""
     ensure_ffmpeg()
     source = Path(input_path)
     output = Path(output_path) if output_path else source.with_name(f"{source.stem}_converted.wav")
-    try:
-        audio = AudioSegment.from_file(str(source))
-    except Exception as exc:
+    command = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
+        "-vn", "-ac", str(TARGET_CHANNELS), "-ar", str(TARGET_SAMPLE_RATE), "-sample_fmt", "s16", str(output),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0 or not output.exists():
+        output.unlink(missing_ok=True)
         raise AudioProcessingError(
             f"Could not read audio from '{source.name}'. The file may be corrupt or contain no audio track."
-        ) from exc
-    if len(audio) == 0:
+        )
+    if get_duration_seconds(str(output)) <= 0:
+        output.unlink(missing_ok=True)
         raise AudioProcessingError(f"'{source.name}' contains no audio.")
-    audio = audio.set_channels(TARGET_CHANNELS).set_frame_rate(TARGET_SAMPLE_RATE)
-    audio.export(str(output), format="wav")
     return str(output)
+
+
+def quiet_split_points(audio: AudioSegment, min_ms: int, max_ms: int, frame_ms: int = 100) -> list[tuple[int, int]]:
+    """Split ``audio`` into consecutive (start, end) ranges between min_ms and max_ms long.
+
+    Each cut is placed on the quietest ``frame_ms`` frame inside the allowed window, so
+    boundaries fall in pauses rather than in the middle of a word.
+    """
+    ranges: list[tuple[int, int]] = []
+    start, total = 0, len(audio)
+    while total - start > max_ms:
+        window_start, window_end = start + min_ms, start + max_ms
+        best_cut, best_rms = window_end, None
+        for frame_start in range(window_start, window_end - frame_ms + 1, frame_ms):
+            rms = audio[frame_start : frame_start + frame_ms].rms
+            if best_rms is None or rms < best_rms:
+                best_cut, best_rms = frame_start + frame_ms // 2, rms
+        ranges.append((start, best_cut))
+        start = best_cut
+    ranges.append((start, total))
+    return ranges
 
 
 def chunk_audio(
@@ -164,22 +214,37 @@ def chunk_audio(
     chunk_minutes: int = DEFAULT_CHUNK_MINUTES,
     output_dir: str | Path | None = None,
 ) -> list[str]:
-    """Split a WAV file into consecutive chunks of ``chunk_minutes`` minutes."""
+    """Split a WAV file into ~``chunk_minutes`` chunks, cutting at the quietest nearby moment."""
     audio = AudioSegment.from_wav(wav_path)
-    chunk_ms = chunk_minutes * 60 * 1000
+    chunk_ms = int(chunk_minutes * 60 * 1000)
+    window = min(CUT_SEARCH_WINDOW_MS, chunk_ms // 4)
     target_dir = Path(output_dir) if output_dir else Path(wav_path).parent
     stem = Path(wav_path).stem
 
     chunks: list[str] = []
-    for index, start in enumerate(range(0, len(audio), chunk_ms)):
+    for index, (start, end) in enumerate(quiet_split_points(audio, chunk_ms - window, chunk_ms + window)):
         chunk_path = target_dir / f"{stem}_chunk_{index:03d}.wav"
-        audio[start : start + chunk_ms].export(str(chunk_path), format="wav")
+        audio[start:end].export(str(chunk_path), format="wav")
         chunks.append(str(chunk_path))
+    del audio  # free the decoded recording before transcription starts
     return chunks
 
 
 def get_duration_seconds(wav_path: str) -> float:
-    return len(AudioSegment.from_wav(wav_path)) / 1000.0
+    """Duration from the WAV header (no decoding)."""
+    with wave.open(str(wav_path), "rb") as handle:
+        return handle.getnframes() / float(handle.getframerate() or 1)
+
+
+def file_fingerprint(path: str | Path, block_size: int = 1 << 20) -> str:
+    """SHA-256 of a file's content — identifies an upload even if it is renamed."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(block_size), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def process_input(

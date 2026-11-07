@@ -44,7 +44,10 @@ def safe_filename(title: str, suffix: str) -> str:
 
 
 def _header_lines(record: MeetingRecord) -> list[str]:
-    lines = [record.title, "=" * min(len(record.title), 80)]
+    name = record.display_name
+    lines = [name, "=" * min(len(name), 80)]
+    if record.title and record.title != name:
+        lines.append(f"AI title: {record.title}")
     if record.processed_at:
         lines.append(f"Processed: {format_date(record.processed_at)}")
     if record.source:
@@ -242,14 +245,19 @@ def build_pdf_report(
     record: MeetingRecord, include_transcript: bool = True, chat: list[dict[str, Any]] | None = None
 ) -> bytes:
     """Create a formatted PDF meeting report (optionally with the Q&A chat) and return its bytes."""
-    pdf = _ReportPDF(record.title)
-    pdf.set_title(record.title)
+    name = record.display_name
+    pdf = _ReportPDF(name)
+    pdf.set_title(name)
     pdf.set_creator("AI Meeting Assistant")
     pdf.add_page()
 
     pdf.font("B", 19)
     pdf.set_text_color(20, 20, 30)
-    pdf.multi_cell(0, 9, pdf.clean(record.title), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.multi_cell(0, 9, pdf.clean(name), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    if record.title and record.title != name:
+        pdf.font("I", 11)
+        pdf.set_text_color(90, 90, 110)
+        pdf.multi_cell(0, 6, pdf.clean(f"AI title: {record.title}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(1)
     pdf.font("", 9.5)
     pdf.set_text_color(110, 110, 125)

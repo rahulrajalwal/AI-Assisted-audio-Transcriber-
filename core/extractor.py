@@ -126,7 +126,12 @@ def _extract(
     kind: str,
     task: str,
     progress: ProgressFn | None = None,
+    cache=None,
 ) -> str:
+    """Run one extraction chain; long transcripts are sectioned then consolidated.
+
+    ``cache`` (e.g. a MeetingCheckpoint) keeps finished section results for retries.
+    """
     text = (transcript or "").strip()
     if not text:
         raise ValueError("Cannot extract information from an empty transcript.")
@@ -134,7 +139,7 @@ def _extract(
     chain = build_chain(system_prompt)
     budget = input_char_budget(reserve_tokens=150)  # extraction prompts are longer
     if len(text) <= (EXTRACTION_SINGLE_PASS_MAX_CHARS or budget):
-        result = invoke_with_retry(chain, text, task=task)
+        result = invoke_with_retry(chain, text, task=task, cache=cache, cache_key=kind)
         return empty_message if _is_empty_result(result, empty_message) else result
 
     sections = split_transcript(text, EXTRACTION_CHUNK_CHARS or int(budget * 0.9), EXTRACTION_CHUNK_OVERLAP)
@@ -142,7 +147,9 @@ def _extract(
     for index, section in enumerate(sections, start=1):
         if progress:
             progress(f"{task}: section {index}/{len(sections)}", None)
-        result = invoke_with_retry(chain, section, task=f"{task} (section {index}/{len(sections)})")
+        result = invoke_with_retry(
+            chain, section, task=f"{task} (section {index}/{len(sections)})", cache=cache, cache_key=kind
+        )
         if not _is_empty_result(result, empty_message):
             partial_results.append(result)
 
@@ -153,7 +160,9 @@ def _extract(
     consolidate_chain = _build_consolidate_chain(kind, empty_message)
 
     def consolidate(block: str) -> str:
-        return invoke_with_retry(consolidate_chain, block, task=f"{task} (consolidation)")
+        return invoke_with_retry(
+            consolidate_chain, block, task=f"{task} (consolidation)", cache=cache, cache_key=f"{kind}-merge"
+        )
 
     # Hierarchical: merge groups of lists that fit the context budget, until one remains.
     lists = collapse_summaries(partial_results, consolidate, max_chars=budget)
@@ -165,24 +174,24 @@ def _extract(
     return empty_message if _is_empty_result(consolidated, empty_message) else consolidated
 
 
-def extract_action_items(transcript: str, progress: ProgressFn | None = None) -> str:
+def extract_action_items(transcript: str, progress: ProgressFn | None = None, cache=None) -> str:
     """Numbered Markdown list of action items (owner/deadline only when stated)."""
     return _extract(
-        transcript, ACTION_ITEMS_PROMPT, NO_ACTION_ITEMS, "action-item lists", "Action-item extraction", progress
+        transcript, ACTION_ITEMS_PROMPT, NO_ACTION_ITEMS, "action-item lists", "Action-item extraction", progress, cache
     )
 
 
-def extract_key_decisions(transcript: str, progress: ProgressFn | None = None) -> str:
+def extract_key_decisions(transcript: str, progress: ProgressFn | None = None, cache=None) -> str:
     """Numbered Markdown list of decisions that were explicitly made."""
     return _extract(
-        transcript, KEY_DECISIONS_PROMPT, NO_KEY_DECISIONS, "key-decision lists", "Key-decision extraction", progress
+        transcript, KEY_DECISIONS_PROMPT, NO_KEY_DECISIONS, "key-decision lists", "Key-decision extraction", progress, cache
     )
 
 
-def extract_questions(transcript: str, progress: ProgressFn | None = None) -> str:
+def extract_questions(transcript: str, progress: ProgressFn | None = None, cache=None) -> str:
     """Numbered Markdown list of unresolved questions / follow-up topics."""
     return _extract(
-        transcript, OPEN_QUESTIONS_PROMPT, NO_OPEN_QUESTIONS, "open-question lists", "Open-question extraction", progress
+        transcript, OPEN_QUESTIONS_PROMPT, NO_OPEN_QUESTIONS, "open-question lists", "Open-question extraction", progress, cache
     )
 
 

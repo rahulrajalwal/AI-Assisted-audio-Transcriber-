@@ -11,13 +11,15 @@ Storage design
   is ever cleared or recreated; chunks written by older versions (no metadata)
   stay searchable in "all meetings" mode.
 * Every chunk has a deterministic ID ``<meeting_id>-<chunk_index>`` and metadata:
-  meeting_id, title, meeting_date / meeting_ts, processed_at, source, source_type,
+  meeting_id, title (AI title), source_title (original YouTube title / filename),
+  meeting_date / meeting_ts, processed_at, source, source_type,
   language, chunk_id, chunk_index, char_start/char_end, audio time range
   (start_seconds / end_seconds / audio_chunk when timestamps are available),
   embedding_model, chunk_size, schema_version.
-* Re-processing the same transcript is skipped (no duplicates). An intentional
-  re-index (``replace=True``) upserts that meeting's chunks and deletes only its
-  stale chunks — other meetings are never touched.
+* Re-processing a meeting never duplicates chunks: if its chunks are already all
+  stored it is skipped; an incomplete index (e.g. interrupted) or an intentional
+  re-index (``replace=True``) upserts that meeting's chunks under the same IDs and
+  deletes only its stale chunks — other meetings are never touched.
 * :func:`backup_vector_store` copies the database folder before risky operations.
 """
 
@@ -123,6 +125,11 @@ def meeting_exists(vector_store: Chroma, meeting_id: str) -> bool:
     return bool(result.get("ids"))
 
 
+def count_meeting_chunks(meeting_id: str, vector_store: Chroma | None = None) -> int:
+    store = vector_store or load_vector_store()
+    return len(store.get(where={"meeting_id": meeting_id}, include=[]).get("ids") or [])
+
+
 def backup_vector_store(persist_directory: str | Path | None = None) -> Path | None:
     """Copy the ChromaDB folder to ``backups/vector_db-<timestamp>``. Returns the backup path."""
     source = Path(persist_directory or chroma_dir())
@@ -193,6 +200,7 @@ def build_documents(
     processed_at: str,
     meeting_date: str,
     segments: list[dict] | None,
+    source_title: str = "",
 ) -> tuple[list[Document], list[str]]:
     meeting_ts = _meeting_timestamp(meeting_date, processed_at)
     docs, ids = [], []
@@ -203,6 +211,7 @@ def build_documents(
         metadata = {
             "meeting_id": meeting_id,
             "title": title or "Untitled Meeting",
+            "source_title": source_title or title or "Untitled Meeting",
             "meeting_date": meeting_date or processed_at[:10],
             "meeting_ts": meeting_ts,
             "processed_at": processed_at,
@@ -228,6 +237,7 @@ def build_vector_store(
     *,
     meeting_id: str | None = None,
     title: str = "Untitled Meeting",
+    source_title: str = "",
     source: str = "",
     source_type: str = "",
     language: str = "",
@@ -239,9 +249,10 @@ def build_vector_store(
 ) -> Chroma:
     """Chunk, embed and store one meeting's transcript; return the persistent store.
 
-    * Already indexed and ``replace`` is False → skipped (no duplicate chunks).
-    * ``replace=True`` → this meeting's chunks are upserted under the same IDs and any
-      leftover chunks of *this meeting only* are deleted.
+    * All of this meeting's chunks already stored and ``replace`` is False → skipped.
+    * Otherwise (new, partially indexed, or ``replace=True``) its chunks are upserted
+      under deterministic IDs and leftover chunks of *this meeting only* are deleted,
+      so reprocessing never creates duplicates.
     """
     text = (transcript or "").strip()
     if not text:
@@ -251,23 +262,23 @@ def build_vector_store(
     meeting_id = meeting_id or compute_meeting_id(text)
     processed_at = processed_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+    docs, ids = build_documents(
+        text,
+        meeting_id=meeting_id,
+        title=title,
+        source_title=source_title,
+        source=source,
+        source_type=source_type,
+        language=language,
+        processed_at=processed_at,
+        meeting_date=meeting_date,
+        segments=segments,
+    )
     with _store_lock:
         existing_ids = set(store.get(where={"meeting_id": meeting_id}, include=[]).get("ids") or [])
-        if existing_ids and not replace:
+        if existing_ids and not replace and set(ids) <= existing_ids:
             logger.info("Meeting %s is already indexed (%d chunks); skipping.", meeting_id, len(existing_ids))
             return store
-
-        docs, ids = build_documents(
-            text,
-            meeting_id=meeting_id,
-            title=title,
-            source=source,
-            source_type=source_type,
-            language=language,
-            processed_at=processed_at,
-            meeting_date=meeting_date,
-            segments=segments,
-        )
         store.add_documents(documents=docs, ids=ids)  # upsert by deterministic ID
         stale = sorted(existing_ids - set(ids))
         if stale:
@@ -307,7 +318,7 @@ def list_indexed_meetings(vector_store: Chroma | None = None) -> list[dict]:
             meeting_id,
             {
                 "meeting_id": meeting_id,
-                "title": metadata.get("title") or "Earlier meeting (no metadata)",
+                "title": metadata.get("source_title") or metadata.get("title") or "Earlier meeting (no metadata)",
                 "meeting_date": metadata.get("meeting_date", ""),
                 "meeting_ts": metadata.get("meeting_ts", 0),
                 "processed_at": metadata.get("processed_at", ""),

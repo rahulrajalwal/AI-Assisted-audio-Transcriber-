@@ -134,3 +134,36 @@ def test_suggested_question_button_asks(app, monkeypatch):
     assert not at.exception
     assert seen["question"] == "What were the main topics discussed?"
     assert at.session_state["meeting_tab"] == "Ask Your Meeting"
+
+
+def test_history_shows_original_name_and_ai_title(app):
+    save_meeting(make_record(meeting_id="1" * 16, title="Launch Planning Sync", source_title="Me at the zoo"))
+    save_meeting(make_record(meeting_id="2" * 16, title="Budget Review", source="C:/rec/q2-budget.m4a",
+                             source_type="local_file"))
+    at = app.run()
+    labels = [b.label for b in at.button]
+    assert "Me at the zoo" in labels and "q2-budget.m4a" in labels  # original names, not AI titles
+    next(b for b in at.button if b.label == "Me at the zoo").click().run()
+    assert not at.exception
+    heads = [m.value for m in at.markdown if m.value.startswith("<div class=\"meeting-head\"")]
+    assert heads and "<h1>Me at the zoo</h1>" in heads[0] and "AI title: Launch Planning Sync" in heads[0]
+    assert at.session_state["meeting_id"] == "1" * 16
+    assert at.session_state["chat_scope"] == "This meeting"  # meeting-specific chat by default
+
+
+def test_unfinished_job_can_be_resumed(app, monkeypatch):
+    import core.pipeline
+    from core.meeting_store import MeetingCheckpoint
+
+    checkpoint = MeetingCheckpoint("3" * 16)
+    checkpoint.start("file:abc", source_title="Long Board Meeting.mp4", language="english", status="failed",
+                     error="Whisper failed on audio part 10 of 12", chunk_plan=[f"c{i}" for i in range(12)])
+    for index in range(9):
+        checkpoint.save_chunk(index, [{"start": 0.0, "end": 1.0, "text": "x"}])
+    resumed = []
+    monkeypatch.setattr(core.pipeline, "resume_meeting", lambda meeting_id, progress=None: resumed.append(meeting_id))
+    at = app.run()
+    resume = next(b for b in at.button if b.label == "Resume: Long Board Meeting.mp4")
+    assert "9 of 12 audio parts transcribed" in resume.help
+    resume.click().run()
+    assert resumed == ["3" * 16]

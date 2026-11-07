@@ -91,13 +91,29 @@ def test_corrupt_file_raises(tmp_path):
 
 
 @requires_ffmpeg
-def test_chunking(tmp_path):
+def test_chunking_covers_audio_in_order(tmp_path):
     wav = tmp_path / "long.wav"
     Sine(300).to_audio_segment(duration=130_000).set_channels(1).set_frame_rate(16_000).export(wav, format="wav")
     chunks = ap.chunk_audio(str(wav), chunk_minutes=1, output_dir=tmp_path)
     lengths = [len(AudioSegment.from_wav(c)) for c in chunks]
-    assert len(chunks) == 3
-    assert lengths[0] == 60_000 and lengths[1] == 60_000 and 9_900 <= lengths[2] <= 10_100
+    assert sum(lengths) == 130_000  # nothing lost or duplicated
+    assert all(45_000 <= n <= 75_000 for n in lengths[:-1])  # ~1 minute each (cut window +-15 s)
+
+
+def test_cuts_land_in_silence():
+    from pydub import AudioSegment as Seg
+
+    tone = Sine(440).to_audio_segment(duration=1_000).set_frame_rate(16_000).set_channels(1)
+    # 58 s of "speech", a 1-second pause, then more speech: the cut must fall inside the pause
+    audio = tone * 58 + Seg.silent(duration=1_000, frame_rate=16_000) + tone * 30
+    (start, cut), (cut2, end) = ap.quiet_split_points(audio, 45_000, 75_000)
+    assert start == 0 and cut == cut2 and end == len(audio)
+    assert 58_000 <= cut <= 59_000
+
+
+@requires_ffmpeg
+def test_duration_from_header(tone_wav):
+    assert abs(ap.get_duration_seconds(str(tone_wav)) - 3.0) < 0.01
 
 
 @requires_ffmpeg
@@ -118,7 +134,7 @@ def test_cleanup_refuses_paths_outside_work_dir(tmp_path):
 
 
 @requires_ffmpeg
-def test_youtube_download_uses_extracted_wav(monkeypatch, tmp_path, tone_wav):
+def test_youtube_download_keeps_original_stream(monkeypatch, tmp_path, tone_wav):
     """yt-dlp is mocked: verify the WAV produced by FFmpegExtractAudio is located correctly."""
     import yt_dlp
 
@@ -136,17 +152,16 @@ def test_youtube_download_uses_extracted_wav(monkeypatch, tmp_path, tone_wav):
 
         def extract_info(self, url, download):
             out_dir = Path(captured["opts"]["outtmpl"]).parent
-            (out_dir / "abc123.wav").write_bytes(tone_wav.read_bytes())
-            return {"id": "abc123", "ext": "webm"}
+            (out_dir / "abc123.webm").write_bytes(tone_wav.read_bytes())
+            return {"id": "abc123", "ext": "webm", "title": "Original Title"}
 
         def prepare_filename(self, info):
             return str(Path(captured["opts"]["outtmpl"]).parent / "abc123.webm")
 
     monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYDL)
     path = ap.download_youtube_audio("https://youtu.be/abc123", tmp_path)
-    assert path.endswith("abc123.wav") and Path(path).exists()
-    assert captured["opts"]["noplaylist"] is True
-    assert captured["opts"]["postprocessors"][0]["preferredcodec"] == "wav"
+    assert path.endswith("abc123.webm") and Path(path).exists()  # original stream, no huge WAV
+    assert captured["opts"]["noplaylist"] is True and "postprocessors" not in captured["opts"]
 
 
 @requires_ffmpeg

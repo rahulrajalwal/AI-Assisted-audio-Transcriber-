@@ -89,21 +89,61 @@ def test_sarvam_reads_env_at_call_time(monkeypatch):
     assert tr._sarvam_config() == ("late-key", "saaras:v2.5")
 
 
-def test_sarvam_splits_into_25s_pieces(monkeypatch, wav_60s):
+def test_sarvam_pieces_are_short_contiguous_and_ordered(monkeypatch, wav_60s):
     monkeypatch.setenv("SARVAM_API_KEY", "k")
-    calls = []
+    monkeypatch.setenv("SARVAM_CONCURRENCY", "3")
+    import threading
+    import time as _time
+
+    calls, lock = [], threading.Lock()
 
     def fake_post(url, headers, files, data, timeout):
-        calls.append((url, headers, data))
-        return FakeResponse(200, {"transcript": f"piece{len(calls)}"})
+        name = files["file"][0]  # chunk.wav_sv_<index>.wav
+        index = int(name.rsplit("_", 1)[1].split(".")[0])
+        _time.sleep(0.05 * (3 - index))  # later pieces finish first: order must still be kept
+        with lock:
+            calls.append((index, headers, data))
+        return FakeResponse(200, {"transcript": f"piece{index}"})
 
     monkeypatch.setattr(tr.requests, "post", fake_post)
     segments = tr.sarvam_segments(wav_60s)
-    assert " ".join(s["text"] for s in segments) == "piece1 piece2 piece3"
-    assert [(s["start"], s["end"]) for s in segments] == [(0.0, 25.0), (25.0, 50.0), (50.0, 60.0)]
-    assert len(calls) == 3  # 25s + 25s + 10s
-    assert calls[0][1] == {"api-subscription-key": "k"}
-    assert calls[0][2]["model"]
+    assert [s["text"] for s in segments] == [f"piece{i}" for i in range(len(segments))]
+    assert segments[0]["start"] == 0.0 and segments[-1]["end"] == 60.0
+    assert all(b["start"] == a["end"] for a, b in zip(segments, segments[1:]))  # contiguous
+    assert all(s["end"] - s["start"] <= 29.0 for s in segments)  # Sarvam's 30 s limit
+    assert len(calls) == len(segments) >= 3
+    assert calls[0][1] == {"api-subscription-key": "k"} and calls[0][2]["model"]
+
+
+def test_completed_chunks_are_not_transcribed_again(monkeypatch):
+    monkeypatch.setattr(tr, "load_model", lambda: None)
+    monkeypatch.setattr(tr, "_chunk_duration_seconds", lambda p: 600.0)
+    calls, saved = [], {}
+    monkeypatch.setattr(tr, "whisper_segments", lambda p: calls.append(p) or _segs(f"text-{p}"))
+    done = {0: _segs("saved-a"), 1: _segs("saved-b")}
+    text, segments = tr.transcribe_all_with_segments(
+        ["a", "b", "c"], "english", completed=done, on_chunk_done=lambda i, s: saved.update({i: s})
+    )
+    assert calls == ["c"] and list(saved) == [2]
+    assert text == "saved-a saved-b text-c"
+    assert segments[2]["start"] == 1200.0 and segments[2]["audio_chunk"] == 2
+
+
+def test_failed_chunk_reports_resume_point(monkeypatch):
+    monkeypatch.setattr(tr, "load_model", lambda: None)
+    monkeypatch.setattr(tr, "_chunk_duration_seconds", lambda p: 600.0)
+
+    def flaky(path):
+        if path == "c":
+            raise RuntimeError("network down")
+        return _segs(f"text-{path}")
+
+    monkeypatch.setattr(tr, "whisper_segments", flaky)
+    saved = {}
+    with pytest.raises(tr.TranscriptionError, match="part 3 of 4") as info:
+        tr.transcribe_all_with_segments(["a", "b", "c", "d"], "english", on_chunk_done=lambda i, s: saved.update({i: s}))
+    assert sorted(saved) == [0, 1]  # chunks 1-2 were saved before the failure
+    assert "continue from part 3" in str(info.value)
 
 
 def test_sarvam_retries_rate_limit(monkeypatch, wav_60s):

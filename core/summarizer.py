@@ -31,12 +31,14 @@ logger = logging.getLogger(__name__)
 # Sizes are in characters. ``None`` means "derive from the model's context window"
 # (core.llm.input_char_budget); set an int to override (tests do this).
 SINGLE_PASS_MAX_CHARS: int | None = None
-MAP_CHUNK_CHARS: int | None = None
+# Long meetings: ~30,000 characters ≈ 20–25 minutes of speech per MAP call, so a two-hour
+# meeting becomes ~5 sections whose notes keep detail from every part of the recording.
+MAP_CHUNK_CHARS: int | None = 30_000
 MAP_CHUNK_OVERLAP = 300
 REDUCE_MAX_CHARS: int | None = None
 MAX_COLLAPSE_ROUNDS = 6
 TITLE_INPUT_MAX_CHARS = 4_000
-MAP_SUMMARY_MAX_WORDS = 180  # keeps intermediate summaries small so reductions fit
+MAP_SUMMARY_MAX_WORDS = 300  # detailed enough per section, small enough that reductions fit
 TITLE_MAX_WORDS = 10
 
 ProgressFn = Callable[[str, float | None], None]
@@ -226,8 +228,12 @@ def collapse_summaries(
 # ── Public API ──────────────────────────────────────────────────────────────────
 
 
-def summarize(transcript: str, progress: ProgressFn | None = None) -> str:
-    """Return a structured Markdown summary of the transcript (Map-Reduce)."""
+def summarize(transcript: str, progress: ProgressFn | None = None, cache=None) -> str:
+    """Return a structured Markdown summary of the transcript (Map-Reduce).
+
+    ``cache`` (e.g. a MeetingCheckpoint) keeps every finished MAP/REDUCE result, so a
+    retry after a failure only repeats the requests that did not complete.
+    """
     text = (transcript or "").strip()
     if not text:
         raise ValueError("Cannot summarise an empty transcript.")
@@ -244,6 +250,8 @@ def summarize(transcript: str, progress: ProgressFn | None = None) -> str:
             final_chain,
             {"text": text, "source_description": "its full transcript"},
             task="Meeting summary",
+            cache=cache,
+            cache_key="summary-final",
         )
 
     chunks = split_transcript(text)
@@ -256,6 +264,8 @@ def summarize(transcript: str, progress: ProgressFn | None = None) -> str:
                 map_chain,
                 {"text": chunk, "part": index, "total": len(chunks)},
                 task=f"Summary of section {index}/{len(chunks)}",
+                cache=cache,
+                cache_key="summary-map",
             )
         )
 
@@ -263,7 +273,9 @@ def summarize(transcript: str, progress: ProgressFn | None = None) -> str:
 
     def collapse(text_block: str) -> str:
         report("Condensing intermediate summaries", None)
-        return invoke_with_retry(collapse_chain, {"text": text_block}, task="Summary reduction")
+        return invoke_with_retry(
+            collapse_chain, {"text": text_block}, task="Summary reduction", cache=cache, cache_key="summary-collapse"
+        )
 
     partials = collapse_summaries(partials, collapse)
 
@@ -279,10 +291,12 @@ def summarize(transcript: str, progress: ProgressFn | None = None) -> str:
             "source_description": "chronological notes covering consecutive parts of the meeting",
         },
         task="Meeting summary",
+        cache=cache,
+        cache_key="summary-final",
     )
 
 
-def generate_title(transcript: str, summary: str | None = None) -> str:
+def generate_title(transcript: str, summary: str | None = None, cache=None) -> str:
     """Generate a short meeting title.
 
     Uses the summary when available (it covers the whole meeting); otherwise an
@@ -292,5 +306,5 @@ def generate_title(transcript: str, summary: str | None = None) -> str:
     if not source:
         raise ValueError("Cannot generate a title from empty text.")
     return invoke_with_retry(
-        build_title_chain(), source[:TITLE_INPUT_MAX_CHARS], task="Title generation"
+        build_title_chain(), source[:TITLE_INPUT_MAX_CHARS], task="Title generation", cache=cache, cache_key="title"
     )

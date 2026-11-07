@@ -31,6 +31,8 @@ commented out, in the "INACTIVE HOSTED-MODEL INTEGRATIONS" section at the bottom
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import random
@@ -504,6 +506,8 @@ def invoke_with_retry(
     task: str = "LLM request",
     max_attempts: int | None = None,
     sleep: Callable[[float], None] | None = None,
+    cache: Any = None,
+    cache_key: str | None = None,
 ) -> Any:
     """Invoke an LCEL runnable — one request at a time — with at most one retry.
 
@@ -511,13 +515,26 @@ def invoke_with_retry(
     honouring Retry-After / X-RateLimit-Reset up to MAX_RETRY_DELAY_SECONDS. Fails fast on
     the daily quota, bad keys and unavailable models. Never switches to another model.
     Always raises :class:`LLMError` subclasses with secret-free, actionable messages.
+
+    Checkpointing: with ``cache`` (any mapping with ``get``/``[]=``, e.g. a
+    MeetingCheckpoint) and ``cache_key``, a result already produced for the same step,
+    model and input is returned without a new request, and new results are stored.
     """
+    if cache is not None and cache_key:
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+        cache_key = f"{cache_key}|{get_model_name()}|{digest}"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
     attempts = max(1, max_attempts or DEFAULT_MAX_ATTEMPTS)
     for attempt in range(1, attempts + 1):
         try:
             _throttle()
             with _inference_lock:
-                return runnable.invoke(payload)
+                result = runnable.invoke(payload)
+            if cache is not None and cache_key:
+                cache[cache_key] = result
+            return result
         except Exception as exc:
             kind = classify_error(exc)
             retryable = kind in (_RETRYABLE, _RATE_LIMITED)

@@ -40,3 +40,6 @@ dist/
 
 # Database backups
 backups/
+
+# Streamlit Community Cloud secrets (set them in the Cloud dashboard instead)
+.streamlit/secrets.toml

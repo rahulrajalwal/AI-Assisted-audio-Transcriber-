@@ -13,6 +13,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 import requests
@@ -22,9 +23,11 @@ from core.config import load_environment
 
 logger = logging.getLogger(__name__)
 
-# Sarvam's sync STT-translate API rejects audio longer than 30s.
-# Each chunk is sliced into 25s pieces (5s safety margin) before sending.
-SARVAM_PIECE_SECONDS = 25
+# Sarvam's sync STT-translate API rejects audio longer than 30 s (docs: "30 s per REST
+# request"). Pieces are 20–29 s long and cut at the quietest moment (never mid-word).
+SARVAM_PIECE_MIN_MS, SARVAM_PIECE_MAX_MS = 20_000, 29_000
+# Pay-as-you-go limit is 60 requests/minute, so only a couple of pieces run in parallel.
+SARVAM_DEFAULT_CONCURRENCY = 2
 SARVAM_STT_TRANSLATE_URL = "https://api.sarvam.ai/speech-to-text-translate"
 SARVAM_DEFAULT_MODEL = "saaras:v2.5"
 SARVAM_MAX_ATTEMPTS = 3
@@ -94,6 +97,9 @@ def whisper_segments(chunk_path: str) -> list[Segment]:
         language="en",
         fp16=torch.cuda.is_available(),
         verbose=None,  # no console progress bar
+        # Long recordings: don't feed earlier text back in as context. This prevents
+        # Whisper's known "repetition loop" failure from spreading through a long chunk.
+        condition_on_previous_text=False,
     )
     segments = [
         {"start": float(seg["start"]), "end": float(seg["end"]), "text": seg["text"].strip()}
@@ -167,28 +173,36 @@ def _send_to_sarvam(piece_path: str, api_key: str | None = None, model: str | No
     raise TranscriptionError("Sarvam AI transcription failed.")  # pragma: no cover
 
 
+def sarvam_concurrency() -> int:
+    load_environment()
+    try:
+        return max(1, min(8, int(os.getenv("SARVAM_CONCURRENCY") or SARVAM_DEFAULT_CONCURRENCY)))
+    except ValueError:
+        return SARVAM_DEFAULT_CONCURRENCY
+
+
 def sarvam_segments(chunk_path: str) -> list[Segment]:
-    """Split a chunk into ≤25s pieces, send each to Sarvam; one timed segment per piece."""
+    """Cut a chunk into ≤29 s pieces at pauses, send them to Sarvam (a few in parallel), keep order."""
+    from utils.audio_processor import quiet_split_points
+
     api_key, model = _sarvam_config()
     audio = AudioSegment.from_wav(chunk_path)
-    piece_ms = SARVAM_PIECE_SECONDS * 1000
-    total_pieces = max(1, (len(audio) + piece_ms - 1) // piece_ms)
+    ranges = quiet_split_points(audio, SARVAM_PIECE_MIN_MS, SARVAM_PIECE_MAX_MS)
 
-    segments: list[Segment] = []
-    for index, start in enumerate(range(0, len(audio), piece_ms)):
-        piece = audio[start : start + piece_ms]
+    def transcribe_piece(item: tuple[int, tuple[int, int]]) -> Segment | None:
+        index, (start, end) = item
         piece_path = f"{chunk_path}_sv_{index}.wav"
-        piece.export(piece_path, format="wav")
+        audio[start:end].export(piece_path, format="wav")
         try:
-            logger.info("Sarvam piece %d/%d", index + 1, total_pieces)
             text = _send_to_sarvam(piece_path, api_key, model)
-            if text:
-                segments.append({"start": start / 1000, "end": (start + len(piece)) / 1000, "text": text})
         finally:
             if os.path.exists(piece_path):
                 os.remove(piece_path)
-    del audio  # free the decoded chunk promptly
-    return segments
+        return {"start": start / 1000, "end": end / 1000, "text": text} if text else None
+
+    with ThreadPoolExecutor(max_workers=sarvam_concurrency()) as pool:
+        results = list(pool.map(transcribe_piece, enumerate(ranges)))  # map() keeps chronological order
+    return [segment for segment in results if segment]
 
 
 def transcribe_chunk_sarvam(chunk_path: str) -> str:
@@ -208,8 +222,11 @@ def transcribe_chunk(chunk_path: str, language: str = "english") -> str:
 
 
 def _chunk_duration_seconds(chunk_path: str) -> float:
+    """Chunk length from its WAV header (no decoding) — the offset of the next chunk."""
+    from utils.audio_processor import get_duration_seconds
+
     try:
-        return len(AudioSegment.from_wav(chunk_path)) / 1000.0
+        return get_duration_seconds(chunk_path)
     except Exception:
         return 0.0
 
@@ -218,6 +235,8 @@ def transcribe_all_with_segments(
     chunks: list[str],
     language: str = "english",
     progress: ProgressFn | None = None,
+    completed: dict[int, list[Segment]] | None = None,
+    on_chunk_done: Callable[[int, list[Segment]], None] | None = None,
 ) -> tuple[str, list[dict]]:
     """Transcribe all audio chunks in order.
 
@@ -225,13 +244,21 @@ def transcribe_all_with_segments(
     ``start``/``end`` seconds, its ``audio_chunk`` index and its ``char_start``/
     ``char_end`` position in the transcript — used to timestamp the text chunks
     stored in ChromaDB.
+
+    Checkpointing: chunks listed in ``completed`` (index → chunk-relative segments
+    saved earlier) are not transcribed again; ``on_chunk_done`` is called after each
+    newly transcribed chunk so the caller can save it before moving on.
     """
+    completed = dict(completed or {})
     language = normalize_language(language)
     if not chunks:
         raise TranscriptionError("No audio chunks to transcribe.")
 
     engine = LANGUAGE_ENGINES[language]
-    if language == "english":
+    pending = [index for index in range(len(chunks)) if index not in completed]
+    if not pending:
+        pass  # everything was transcribed earlier — just reassemble
+    elif language == "english":
         if progress:
             progress(f"Loading Whisper model '{get_whisper_model_name()}'", 0.0)
         load_model()
@@ -243,14 +270,24 @@ def transcribe_all_with_segments(
     cursor = 0  # character position in the joined transcript
     offset = 0.0  # seconds from the start of the meeting
     for index, chunk in enumerate(chunks):
-        if progress:
-            progress(f"{engine}: transcribing part {index + 1}/{len(chunks)}", index / len(chunks))
-        try:
-            chunk_segments = transcribe_chunk_segments(chunk, language=language)
-        except TranscriptionError:
-            raise
-        except Exception as exc:
-            raise TranscriptionError(f"{engine} failed on audio part {index + 1}/{len(chunks)}: {exc}") from exc
+        if index in completed:
+            chunk_segments = completed[index]
+        else:
+            if progress:
+                done = len(chunks) - len(pending)
+                note = f" ({done} saved part(s) reused)" if done else ""
+                progress(f"{engine}: transcribing part {index + 1}/{len(chunks)}{note}", index / len(chunks))
+            try:
+                chunk_segments = transcribe_chunk_segments(chunk, language=language)
+            except Exception as exc:
+                saved = sum(1 for i in range(len(chunks)) if i in completed)
+                raise TranscriptionError(
+                    f"{engine} failed on audio part {index + 1} of {len(chunks)} ({exc}). "
+                    f"{saved} part(s) are saved — resuming will continue from part {index + 1}."
+                ) from exc
+            completed[index] = chunk_segments
+            if on_chunk_done:
+                on_chunk_done(index, chunk_segments)
         for seg in chunk_segments:
             text = seg["text"].strip()
             if not text:

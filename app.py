@@ -15,8 +15,9 @@ from pathlib import Path
 
 import streamlit as st
 
-from core.config import load_environment, reload_environment, work_dir
+from core.config import load_environment, load_streamlit_secrets, reload_environment, work_dir
 
+load_streamlit_secrets()  # Streamlit Community Cloud: keys from st.secrets (locally: .env)
 load_environment()  # must happen before modules that read configuration are used
 
 st.set_page_config(
@@ -28,13 +29,20 @@ st.set_page_config(
 
 from core.extractor import count_items  # noqa: E402
 from core.llm import LLMError, check_openrouter, get_model_name, get_provider_label  # noqa: E402
-from core.meeting_store import MeetingRecord, list_meetings, load_chats, load_meeting, save_chats  # noqa: E402
+from core.meeting_store import (  # noqa: E402
+    MeetingRecord,
+    list_checkpoints,
+    list_meetings,
+    load_chats,
+    load_meeting,
+    save_chats,
+)
 from core.pipeline import (  # noqa: E402
     STAGE_LABELS,
     STAGES,
     PipelineError,
     ProgressEvent,
-    analyse_transcript,
+    resume_meeting,
     run_pipeline,
 )
 from core.rag_engine import format_timestamp, stream_answer  # noqa: E402
@@ -73,6 +81,7 @@ st.markdown(
 .meeting-head {padding: 1.5rem 1.8rem; border: 1px solid #252C3B; border-radius: 16px; margin-bottom: 1rem;
                background: radial-gradient(120% 160% at 0% 0%, rgba(79,209,197,.11), transparent 55%), #10141D;}
 .meeting-head h1 {font-size: 1.75rem; line-height: 1.2; margin: .6rem 0 0; padding: 0;}
+.meeting-head .ai-title {color: #A5ADBF; font-size: .92rem; margin-top: .35rem;}
 .chips {display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .8rem;}
 .chip {font-size: .78rem; color: #B9BFCC; background: #171D29; border: 1px solid #273042;
        padding: .2rem .65rem; border-radius: 999px;}
@@ -273,6 +282,7 @@ def open_meeting(meeting_id: str) -> None:
     st.session_state.meeting_id = meeting_id
     st.session_state.failure = None
     st.session_state["meeting_tab"] = "Overview"
+    st.session_state["chat_scope"] = SCOPE_THIS  # cross-meeting search only when chosen again
 
 
 def go_home() -> None:
@@ -355,15 +365,33 @@ def render_sidebar(meetings: list[MeetingRecord], busy: bool) -> None:
         )
         st.button("＋  New meeting", width="stretch", type="primary", on_click=go_home, disabled=busy)
 
+        jobs = list_checkpoints()
+        if jobs:
+            st.markdown('<div class="section-title">Unfinished</div>', unsafe_allow_html=True)
+        for job in jobs[:5]:
+            st.button(
+                f"Resume: {job['source_title']}",
+                key=f"resume_{job['meeting_id']}",
+                help=f"{checkpoint_progress(job)} · {job['language'].title()}"
+                + (f" · last error: {job['error'][:160]}" if job["error"] else ""),
+                width="stretch",
+                icon=":material/play_circle:",
+                on_click=queue_resume,
+                args=(job["meeting_id"], job["source_title"], job["language"]),
+                disabled=busy,
+            )
+
         st.markdown('<div class="section-title">Meeting history</div>', unsafe_allow_html=True)
         if not meetings:
             st.caption("Processed meetings will appear here.")
         for record in meetings[:30]:
             active = st.session_state.view == "meeting" and st.session_state.meeting_id == record.meeting_id
+            pending = "" if record.status == "complete" else " · indexing unfinished (open Unfinished to resume)"
             st.button(
-                record.title,
+                record.display_name,
                 key=f"history_{record.meeting_id}",
-                help=f"{format_date(record.processed_at)} · {engine_label(record.language)}",
+                help=f"AI title: {record.title} · {format_date(record.processed_at)} · "
+                f"{engine_label(record.language)}{pending}",
                 width="stretch",
                 type="secondary" if not active else "tertiary",
                 icon=":material/description:",
@@ -456,6 +484,23 @@ def queue_job_from_form(
     st.session_state.job = job
     st.session_state.failure = None
     return None
+
+
+def checkpoint_progress(job: dict) -> str:
+    """Human-readable saved progress of an unfinished job."""
+    if job.get("transcribed"):
+        return "transcript saved — AI analysis pending"
+    if job.get("chunks_total"):
+        return f"{job['chunks_done']} of {job['chunks_total']} audio parts transcribed"
+    return "audio saved" if job.get("status") else "started"
+
+
+def queue_resume(meeting_id: str, label: str, language: str) -> None:
+    reload_environment()
+    llm_status.clear()
+    st.session_state.job = {"kind": "resume", "meeting_id": meeting_id, "label": label, "language": language}
+    st.session_state.failure = None
+    go_home()
 
 
 def render_hero() -> None:
@@ -558,7 +603,9 @@ def render_recent(meetings: list[MeetingRecord], busy: bool) -> None:
     columns = st.columns(3)
     for index, record in enumerate(meetings[:6]):
         with columns[index % 3].container(border=True):
-            st.markdown(f"**{escape_md(record.title)}**")
+            st.markdown(f"**{escape_md(record.display_name)}**")
+            if record.title != record.display_name:
+                st.caption(f"✦ {escape_md(record.title)}")
             st.caption(
                 f"{format_date(record.processed_at)} · {format_duration(record.duration_seconds)} · "
                 f"{record.language.title()} · {count_items(record.action_items)} action items"
@@ -578,29 +625,24 @@ def render_failure(busy: bool) -> None:
     if not failure or busy:
         return
     st.error(f"**Processing failed during: {failure['stage']}**\n\n{failure['message']}", icon=":material/error:")
-    if failure.get("transcript"):
+    meeting_id = failure.get("meeting_id")
+    job = next((j for j in list_checkpoints() if j["meeting_id"] == meeting_id), None) if meeting_id else None
+    if not job and not failure.get("transcript"):
+        return
+    if job:
         st.info(
-            "Transcription finished successfully, so you can retry the AI analysis without "
-            "transcribing the audio again.",
+            f"Progress is saved ({checkpoint_progress(job)}). Resuming continues from the step that failed — "
+            "finished audio parts and AI steps are not repeated.",
             icon=":material/info:",
         )
-        col_retry, col_download = st.columns(2)
-        if col_retry.button("Retry analysis", type="primary", icon=":material/refresh:", width="stretch"):
-            st.session_state.job = {
-                "kind": "retry",
-                "transcript": failure["transcript"],
-                "label": failure["source"],
-                "language": failure["language"],
-                "duration": failure.get("duration"),
-                "segments": failure.get("segments") or [],
-                "source_type": failure.get("source_type", ""),
-                "meeting_date": failure.get("meeting_date", ""),
-                "force": False,
-                "upload_dir": None,
-            }
-            st.session_state.failure = None
-            st.rerun()
-        col_download.download_button(
+    columns = st.columns(2)
+    if job:
+        columns[0].button(
+            "Resume processing", type="primary", icon=":material/play_arrow:", width="stretch",
+            on_click=queue_resume, args=(meeting_id, job["source_title"], job["language"]),
+        )
+    if failure.get("transcript"):
+        columns[1].download_button(
             "Download transcript",
             data=failure["transcript"],
             file_name="transcript.txt",
@@ -614,26 +656,11 @@ def run_job(container) -> None:
     """Execute the queued job, streaming real progress events into the UI."""
     job = st.session_state.job
     with container:
-        status = st.status("Starting…", expanded=True)
-        if job["kind"] == "retry":
-            tracker = ProgressTracker(
-                status, ("input", "audio", "transcription"), "Reused the existing transcript"
-            )
-        else:
-            tracker = ProgressTracker(status)
+        status = st.status(f"Resuming: {job['label']}…" if job["kind"] == "resume" else "Starting…", expanded=True)
+        tracker = ProgressTracker(status)
     try:
-        if job["kind"] == "retry":
-            record = analyse_transcript(
-                job["transcript"],
-                source=job["label"],
-                source_type=job.get("source_type", ""),
-                language=job["language"],
-                duration_seconds=job.get("duration"),
-                segments=job.get("segments"),
-                meeting_date=job.get("meeting_date", ""),
-                progress=tracker,
-                force=job["force"],
-            )
+        if job["kind"] == "resume":
+            record = resume_meeting(job["meeting_id"], progress=tracker)
         else:
             record = run_pipeline(
                 job["source"],
@@ -649,13 +676,10 @@ def run_job(container) -> None:
         st.session_state.failure = {
             "stage": exc.stage_label,
             "message": str(exc),
-            "transcript": exc.transcript or job.get("transcript"),
+            "meeting_id": exc.meeting_id or job.get("meeting_id"),
+            "transcript": exc.transcript,
             "source": job["label"],
             "language": job["language"],
-            "duration": exc.duration_seconds or job.get("duration"),
-            "segments": exc.segments or job.get("segments") or [],
-            "source_type": job.get("source_type", ""),
-            "meeting_date": job.get("meeting_date", ""),
         }
         st.session_state.job = None
     except Exception as exc:  # last-resort boundary: never show a success state after a failure
@@ -663,7 +687,7 @@ def run_job(container) -> None:
         st.session_state.failure = {
             "stage": "Processing",
             "message": f"{type(exc).__name__}: {exc}",
-            "transcript": job.get("transcript"),
+            "meeting_id": job.get("meeting_id"),
             "source": job["label"],
             "language": job["language"],
         }
@@ -744,9 +768,12 @@ def render_meeting_header(record: MeetingRecord) -> None:
     if source:
         chips.append(f"🔗 {source if len(source) <= 60 else source[:57] + '…'}")
     chips_html = "".join(f'<span class="chip">{esc(chip)}</span>' for chip in chips)
+    ai_title = (
+        f'<div class="ai-title">✦ AI title: {esc(record.title)}</div>' if record.title != record.display_name else ""
+    )
     st.markdown(
         f'<div class="meeting-head"><span class="eyebrow">Meeting report</span>'
-        f"<h1>{esc(record.title)}</h1><div class=\"chips\">{chips_html}</div></div>",
+        f"<h1>{esc(record.display_name)}</h1>{ai_title}<div class=\"chips\">{chips_html}</div></div>",
         unsafe_allow_html=True,
     )
 
@@ -766,12 +793,12 @@ def render_metrics_and_actions(record: MeetingRecord) -> None:
     )
     actions[1].download_button(
         "PDF report", data=lambda: build_pdf_report(record, chat=all_messages(record.meeting_id)),
-        file_name=safe_filename(record.title, "report.pdf"), mime="application/pdf",
+        file_name=safe_filename(export_name(record), "report.pdf"), mime="application/pdf",
         icon=":material/picture_as_pdf:", width="stretch",
     )
     actions[2].download_button(
         "Everything (ZIP)", data=lambda: export_bundle(record, all_messages(record.meeting_id)),
-        file_name=safe_filename(record.title, "meeting.zip"), mime="application/zip",
+        file_name=safe_filename(export_name(record), "meeting.zip"), mime="application/zip",
         icon=":material/folder_zip:", width="stretch",
     )
 
@@ -844,8 +871,11 @@ def render_overview(record: MeetingRecord) -> None:
             ("Duration", format_duration(record.duration_seconds)),
             ("Language", engine_label(record.language)),
             ("Model", record.model or get_model_name()),
+            ("Original name", record.display_name),
+            ("AI title", record.title),
             ("Source", (record.source or "—") + (f" ({record.source_type})" if record.source_type else "")),
             ("Meeting ID", record.meeting_id),
+            ("Stored transcript chunks", str(record.vector_chunks) if record.vector_chunks else "—"),
         ]
         for label, value in details:
             st.markdown(f"**{label}:** {escape_md(value)}")
@@ -877,7 +907,7 @@ def render_transcript(record: MeetingRecord) -> None:
         label_visibility="collapsed",
     ).strip()
     right.download_button(
-        "Transcript", data=transcript_to_txt(record), file_name=safe_filename(record.title, "transcript.txt"),
+        "Transcript", data=transcript_to_txt(record), file_name=safe_filename(export_name(record), "transcript.txt"),
         mime="text/plain", icon=":material/download:", width="stretch",
     )
     body, matches = transcript_html(record, query)
@@ -894,7 +924,7 @@ def render_section(record: MeetingRecord, section: str, content: str) -> None:
         st.markdown(content)
     st.download_button(
         "Download this section", data=section_to_txt(record, section),
-        file_name=safe_filename(record.title, f"{section}.txt"), mime="text/plain",
+        file_name=safe_filename(export_name(record), f"{section}.txt"), mime="text/plain",
         icon=":material/download:", key=f"dl_{section}",
     )
 
@@ -958,7 +988,7 @@ def render_chat(record: MeetingRecord) -> None:
         questions_asked = sum(1 for m in history if m["role"] == "user")
         st.caption(f"{questions_asked} question{'s' if questions_asked != 1 else ''} · saved with this meeting")
         st.download_button(
-            "Download chat", data=chat_to_txt(record, history), file_name=safe_filename(record.title, "chat.txt"),
+            "Download chat", data=chat_to_txt(record, history), file_name=safe_filename(export_name(record), "chat.txt"),
             mime="text/plain", icon=":material/download:", width="stretch", disabled=not history,
         )
         if st.button("Clear chat", icon=":material/delete_sweep:", width="stretch", disabled=not history):
@@ -1039,9 +1069,15 @@ def render_downloads(record: MeetingRecord) -> None:
             st.markdown(f"**{name}**")
             st.caption(description)
             st.download_button(
-                f"Download {name.lower()}", data=data, file_name=safe_filename(record.title, suffix), mime=mime,
+                f"Download {name.lower()}", data=data, file_name=safe_filename(export_name(record), suffix), mime=mime,
                 icon=icon, key=f"dlall_{suffix}", width="stretch",
             )
+
+
+def export_name(record: MeetingRecord) -> str:
+    """Base name for downloads: the original title / filename (without its extension)."""
+    name = record.display_name
+    return Path(name).stem if record.source_type in ("upload", "local_file") else name
 
 
 def render_meeting(record: MeetingRecord) -> None:

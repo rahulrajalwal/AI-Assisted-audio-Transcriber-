@@ -290,3 +290,53 @@ class TestStreaming:
         fake_llm("x")
         with pytest.raises(ValueError):
             stream_answer("   ")
+
+
+class TestMeetingScopedRetrieval:
+    """Two stored meetings: a question about one never sees the other."""
+
+    def _store_two(self):
+        from core.meeting_store import MeetingRecord, save_meeting
+
+        product_id, budget_id = compute_meeting_id(PRODUCT), compute_meeting_id(BUDGET)
+        build_vector_store(PRODUCT, meeting_id=product_id, title="Product Sync", source_title="sprint-12 sync.mp4",
+                           meeting_date="2026-03-10")
+        build_vector_store(BUDGET, meeting_id=budget_id, title="Budget Review", source_title="Q2 Budget (YouTube)",
+                           meeting_date="2026-03-03")
+        save_meeting(MeetingRecord(
+            meeting_id=product_id, title="Product Sync", transcript=PRODUCT, summary="### Overview\nSprint 12 sync.",
+            action_items="1. **Fix the image cache** — Arjun", key_decisions="None", open_questions="None",
+            source_title="sprint-12 sync.mp4",
+        ))
+        return product_id, budget_id
+
+    def test_mmr_stays_inside_the_meeting_and_is_chronological(self, fake_embeddings, fake_llm):
+        llm = fake_llm("Answer [Source 1].")
+        product_id, budget_id = self._store_two()
+        for question in ("cloud bill budget", "image cache", "What was decided?"):
+            info, chunks = stream_answer(question, meeting_id=product_id)
+            "".join(chunks)
+            assert info["sources"] and {s["meeting_id"] for s in info["sources"]} == {product_id}
+            positions = [s["chunk_index"] for s in info["sources"]]
+            assert positions == sorted(positions)  # excerpts in meeting order
+            assert all(s["title"] == "sprint-12 sync.mp4" for s in info["sources"])  # original name
+        system = str(llm.calls[-1][0].content)
+        assert "Meeting overview [Overview]" in system and "Fix the image cache" in system
+        assert "Q2 Budget" not in system
+
+    def test_all_meetings_scope_only_when_requested(self, fake_embeddings, fake_llm):
+        llm = fake_llm("Answer.")
+        product_id, budget_id = self._store_two()
+        info, chunks = stream_answer("cloud bill budget engineers", meeting_id=None, k=12)
+        "".join(chunks)
+        assert {s["meeting_id"] for s in info["sources"]} == {product_id, budget_id}
+        assert "Meeting overview" not in str(llm.calls[-1][0].content)  # no single-meeting overview
+
+    def test_reindexing_never_duplicates(self, fake_embeddings):
+        product_id, _ = self._store_two()
+        store = load_vector_store()
+        count = len(_ids(store, product_id))
+        build_vector_store(PRODUCT, meeting_id=product_id, title="Product Sync")
+        store.delete(ids=_ids(store, product_id)[-2:])  # simulate an interrupted index
+        build_vector_store(PRODUCT, meeting_id=product_id, title="Product Sync")
+        assert len(_ids(store, product_id)) == count

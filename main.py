@@ -47,10 +47,13 @@ def main(argv: list[str]) -> int:
         record = run_pipeline(source, language, progress=print_progress)
     except PipelineError as exc:
         print(f"\n✖ Failed during '{exc.stage_label}': {exc}")
+        if exc.meeting_id:
+            print("  Progress is saved. Run the same command again to resume where it stopped.")
         return 1
 
     print("\n" + "=" * 70)
-    print(f"Title: {record.title}")
+    print(f"Meeting: {record.display_name}")
+    print(f"AI title: {record.title}")
     print(f"\nSummary:\n{record.summary}")
     print(f"\nAction Items:\n{record.action_items}")
     print(f"\nKey Decisions:\n{record.key_decisions}")

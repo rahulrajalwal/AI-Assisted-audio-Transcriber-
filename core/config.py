@@ -30,6 +30,21 @@ def load_environment() -> None:
         _env_loaded = True
 
 
+def load_streamlit_secrets() -> bool:
+    """Deployed on Streamlit Community Cloud: expose root-level ``st.secrets`` as environment variables.
+
+    Streamlit copies root-level string/number secrets into ``os.environ`` when its
+    ``secrets.toml`` is parsed, so the rest of the code reads them exactly like ``.env``
+    values. Returns False (silently) when no secrets file exists — e.g. local runs with ``.env``.
+    """
+    try:
+        import streamlit as st
+
+        return st.secrets.load_if_toml_exists()
+    except Exception:  # Streamlit not installed / not running
+        return False
+
+
 def reload_environment() -> bool:
     """Re-read ``.env`` so edits (e.g. a new OPENROUTER_MODEL) apply without restarting the app.
 

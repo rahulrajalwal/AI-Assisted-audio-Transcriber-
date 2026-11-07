@@ -1,11 +1,14 @@
 """Retrieval-Augmented Q&A over stored meeting transcripts (LangChain LCEL).
 
-Flow: question (+ recent chat history) → ChromaDB similarity search over the
-stored transcript chunks → context with meeting/date/time labels (trimmed to the
-model's context budget) → ChatPromptTemplate → chat model (OpenRouter, OPENROUTER_MODEL —
-see core/llm.py) → StrOutputParser → answer + sources.
+Flow: question (+ recent chat history) → ChromaDB MMR search over the stored
+transcript chunks (relevant *and* spread across the recording, so long meetings are
+covered) → excerpts in chronological order with meeting/date/time labels (trimmed to
+the model's context budget) → ChatPromptTemplate → chat model (OpenRouter,
+OPENROUTER_MODEL — see core/llm.py) → StrOutputParser → answer + sources.
 
-* Scope: one meeting (``meeting_id``) or all stored meetings.
+* Scope: one meeting (``meeting_id``, the default in the app) or — only when asked —
+  all stored meetings. One-meeting answers also get a short overview of that meeting
+  (its stored summary and extracted lists) for whole-meeting questions.
 * In all-meetings scope, time references in the question ("previous meeting",
   "yesterday", "this week", "last week", "this month", "last month") are resolved
   against stored meeting dates and turned into a metadata filter. If no meeting
@@ -18,7 +21,7 @@ see core/llm.py) → StrOutputParser → answer + sources.
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Any, Iterator, Sequence
 
 from langchain_core.documents import Document
@@ -34,6 +37,7 @@ from core.llm import (
     invoke_with_retry,
     stream_with_retry,
 )
+from core.meeting_store import load_meeting
 from core.vector_store import (
     build_vector_store,
     compute_meeting_id,
@@ -44,7 +48,10 @@ from core.vector_store import (
 )
 
 NOT_FOUND_MESSAGE = "I could not find this information in the meeting transcript."
-DEFAULT_K = 4
+DEFAULT_K = 6  # excerpts per answer (~800 characters each)
+FETCH_K = 24  # MMR candidates; the k most relevant-yet-different are kept
+MMR_LAMBDA = 0.7  # 1 = pure relevance, 0 = pure diversity
+OVERVIEW_MAX_CHARS = 6_000
 MAX_HISTORY_MESSAGES = 4  # last 2 question/answer pairs (small context window)
 HISTORY_MESSAGE_MAX_CHARS = 500
 CATALOGUE_MAX_MEETINGS = 8
@@ -57,12 +64,13 @@ Answer ONLY from the transcript excerpts in the context below.
 - The "Date" in a source label is the date of that MEETING, not a deadline. Quote deadlines exactly as spoken (e.g. "Wednesday") and never convert them to calendar dates.
 - Distinguish clearly between what was decided and what was only suggested or discussed.
 - When excerpts come from different meetings, say which meeting (title and date) each point comes from.
-- Cite the supporting excerpts inline as [Source N].
+- Cite the supporting excerpts inline as [Source N] and add the time from that source's label when it has one (e.g. [Source 2, ~12:30]). Never state a time that is not in a source label.
+- The meeting overview (if present) was generated from the full transcript: use it for questions about the whole meeting (topics, all decisions, all action items), cite it as [Overview], and prefer the transcript excerpts for details and quotes. When a point also appears in an excerpt, cite that excerpt (with its time) rather than [Overview].
 - Be concise; use bullet points for lists.
 
 Use the conversation history only to understand what a follow-up question refers to — not as a source of facts.
 {scope_note}
-Context (transcript excerpts):
+{overview}Context (transcript excerpts, in chronological order):
 {context}"""
 
 
@@ -79,8 +87,13 @@ def format_timestamp(seconds: Any) -> str:
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
 
 
+def _meeting_name(meta: dict) -> str:
+    """Original YouTube title / filename; older chunks only have the AI title."""
+    return meta.get("source_title") or meta.get("title") or "Untitled meeting"
+
+
 def _source_label(meta: dict) -> str:
-    parts = [f"Meeting: {meta.get('title') or 'Untitled meeting'}"]
+    parts = [f"Meeting: {_meeting_name(meta)}"]
     when = meta.get("meeting_date") or str(meta.get("processed_at", ""))[:10]
     if when:
         parts.append(f"Date: {when}")
@@ -107,7 +120,7 @@ def docs_to_sources(docs: Sequence[Document]) -> list[dict[str, Any]]:
             {
                 "number": number,
                 "meeting_id": meta.get("meeting_id", ""),
-                "title": meta.get("title", "Untitled meeting"),
+                "title": _meeting_name(meta),
                 "meeting_date": meta.get("meeting_date") or str(meta.get("processed_at", ""))[:10],
                 "chunk_index": meta.get("chunk_index"),
                 "start_seconds": meta.get("start_seconds"),
@@ -236,9 +249,31 @@ def _build_prompt() -> ChatPromptTemplate:
     ).partial(not_found=NOT_FOUND_MESSAGE)
 
 
-def retrieve_context(vector_store, meeting_id: str | None, inputs: dict[str, Any], k: int = DEFAULT_K) -> dict[str, Any]:
-    """Similarity-search ChromaDB for the question and keep the chunks that fit the context budget.
+def meeting_overview(meeting_id: str) -> str:
+    """The stored summary and extracted lists of one meeting (empty if not saved)."""
+    record = load_meeting(meeting_id)
+    if record is None or not record.summary:
+        return ""
+    parts = [
+        f"Meeting: {record.display_name}" + (f" (AI title: {record.title})" if record.title != record.display_name else ""),
+        f"Summary:\n{record.summary}",
+        f"Action items:\n{record.action_items}",
+        f"Key decisions:\n{record.key_decisions}",
+        f"Open questions:\n{record.open_questions}",
+    ]
+    text = "\n\n".join(part.strip() for part in parts)
+    return f"Meeting overview [Overview]:\n{text[:OVERVIEW_MAX_CHARS]}\n\n"
 
+
+def _chronological(doc: Document) -> tuple:
+    meta = doc.metadata or {}
+    return (meta.get("meeting_ts") or 0, meta.get("meeting_id", ""), meta.get("chunk_index") or 0)
+
+
+def retrieve_context(vector_store, meeting_id: str | None, inputs: dict[str, Any], k: int = DEFAULT_K) -> dict[str, Any]:
+    """MMR-search ChromaDB for the question and keep the chunks that fit the context budget.
+
+    Restricted to ``meeting_id`` by a metadata filter (no other meeting can leak in).
     Shared by the LCEL chain and the streaming chat so both retrieve identically.
     """
     scope_note, scope_label, ids = "", "", [meeting_id] if meeting_id else None
@@ -251,20 +286,27 @@ def retrieve_context(vector_store, meeting_id: str | None, inputs: dict[str, Any
         else:
             catalogue = _catalogue(meetings, None)
             scope_note = f"Stored meetings (newest first):\n{catalogue}\n" if catalogue else ""
+    empty = {"docs": [], "overview": "", "scope_note": scope_note, "scope_label": scope_label}
     if ids == []:
-        return {**inputs, "docs": [], "scope_note": scope_note, "scope_label": scope_label, "no_meetings_in_scope": True}
+        return {**inputs, **empty, "no_meetings_in_scope": True}
 
-    docs = vector_store.similarity_search(_retrieval_query(inputs), k=k, filter=meeting_filter(ids))
-    # Keep the retrieved context inside the model's context window.
+    docs = vector_store.max_marginal_relevance_search(
+        _retrieval_query(inputs), k=k, fetch_k=max(FETCH_K, k), lambda_mult=MMR_LAMBDA, filter=meeting_filter(ids)
+    )
+    overview = meeting_overview(meeting_id) if meeting_id and docs else ""
+    # Keep the retrieved context inside the model's context window (most relevant first).
     history_tokens = sum(estimate_tokens(str(m.content)) for m in inputs["chat_history"])
-    budget = input_char_budget(reserve_tokens=history_tokens + estimate_tokens(scope_note + inputs["question"]))
+    budget = input_char_budget(
+        reserve_tokens=history_tokens + estimate_tokens(scope_note + overview + inputs["question"])
+    )
     kept, used = [], 0
     for doc in docs:
         if kept and used + len(doc.page_content) > budget:
             break
         kept.append(doc)
         used += len(doc.page_content)
-    return {**inputs, "docs": kept, "scope_note": scope_note, "scope_label": scope_label, "no_meetings_in_scope": False}
+    kept.sort(key=_chronological)  # read in meeting order; [Source N] numbers follow it
+    return {**inputs, **empty, "docs": kept, "overview": overview, "no_meetings_in_scope": False}
 
 
 def _prompt_inputs(state: dict[str, Any]) -> dict[str, Any]:
@@ -273,6 +315,7 @@ def _prompt_inputs(state: dict[str, Any]) -> dict[str, Any]:
         "question": state["question"],
         "chat_history": state["chat_history"],
         "scope_note": state["scope_note"],
+        "overview": state.get("overview", ""),
     }
 
 
