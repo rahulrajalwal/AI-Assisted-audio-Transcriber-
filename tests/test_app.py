@@ -167,3 +167,13 @@ def test_unfinished_job_can_be_resumed(app, monkeypatch):
     assert "9 of 12 audio parts transcribed" in resume.help
     resume.click().run()
     assert resumed == ["3" * 16]
+
+
+def test_failed_download_is_not_reported_as_saved_audio(app):
+    from core.meeting_store import MeetingCheckpoint
+
+    MeetingCheckpoint("4" * 16).start("youtube:x", source_title="Some talk", language="hinglish", status="failed",
+                                      error="Could not download the YouTube audio: HTTP Error 403")
+    at = app.run()
+    resume = next(b for b in at.button if b.label == "Resume: Some talk")
+    assert "audio not downloaded yet" in resume.help and "audio saved" not in resume.help

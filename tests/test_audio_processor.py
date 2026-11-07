@@ -184,3 +184,80 @@ def test_youtube_download_error_is_wrapped(monkeypatch, tmp_path):
     monkeypatch.setattr(yt_dlp, "YoutubeDL", FailingYDL)
     with pytest.raises(ap.AudioProcessingError, match="Video unavailable"):
         ap.download_youtube_audio("https://youtu.be/abc123", tmp_path)
+
+
+def _client_ydl(attempts: list, refuse: set, out_dir: Path):
+    """Fake YoutubeDL that refuses (HTTP 403) the given player clients and records each attempt."""
+    import yt_dlp
+
+    class ClientYDL:
+        def __init__(self, opts):
+            self.client = (opts.get("extractor_args") or {}).get("youtube", {}).get("player_client", [None])[0]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, url, download):
+            attempts.append(self.client)
+            if self.client in refuse:
+                (out_dir / "abc123.webm.part").write_bytes(b"partial")
+                raise yt_dlp.utils.DownloadError("ERROR: unable to download video data: HTTP Error 403: Forbidden")
+            (out_dir / "abc123.webm").write_bytes(b"audio")
+            return {"id": "abc123", "ext": "webm"}
+
+        def prepare_filename(self, info):
+            return str(out_dir / "abc123.webm")
+
+    return ClientYDL
+
+
+@requires_ffmpeg
+def test_youtube_403_retries_other_player_clients(monkeypatch, tmp_path):
+    """Streamlit Cloud: YouTube refuses some clients (HTTP 403) for data-centre IPs — try the next ones."""
+    import yt_dlp
+
+    attempts: list = []
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _client_ydl(attempts, {None, "tv_simply"}, tmp_path))
+    path = ap.download_youtube_audio("https://youtu.be/abc123", tmp_path)
+    assert attempts == [None, "tv_simply", "tv"]  # default clients first, then fallbacks in order
+    assert Path(path).read_bytes() == b"audio" and not list(tmp_path.glob("*.part"))  # no stale partials
+
+
+@requires_ffmpeg
+def test_youtube_403_everywhere_gives_actionable_error(monkeypatch, tmp_path):
+    import yt_dlp
+
+    attempts: list = []
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _client_ydl(attempts, set(ap.YOUTUBE_FALLBACK_CLIENTS), tmp_path))
+    with pytest.raises(ap.AudioProcessingError, match="403.*Deno.*upload the audio or video file"):
+        ap.download_youtube_audio("https://youtu.be/abc123", tmp_path)
+    assert attempts == list(ap.YOUTUBE_FALLBACK_CLIENTS)
+
+
+@requires_ffmpeg
+def test_youtube_non_403_error_is_not_retried(monkeypatch, tmp_path):
+    import yt_dlp
+
+    calls = []
+
+    class Unavailable:
+        def __init__(self, opts):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, url, download):
+            calls.append(1)
+            raise yt_dlp.utils.DownloadError("Private video")
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", Unavailable)
+    with pytest.raises(ap.AudioProcessingError, match="Private video"):
+        ap.download_youtube_audio("https://youtu.be/abc123", tmp_path)
+    assert calls == [1]

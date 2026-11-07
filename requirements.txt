@@ -5,7 +5,8 @@
 # LLM inference runs on OpenRouter (OPENROUTER_API_KEY in .env); nothing is run locally.
 
 # ── Audio / video acquisition & processing ─────────────────────────────────────
-yt-dlp>=2026.10.26                 # YouTube audio download
+yt-dlp[default,deno]>=2026.10.26   # YouTube audio download. [default] adds the yt-dlp-ejs challenge solver and
+                                   # [deno] the Deno JS runtime; without them YouTube refuses downloads (HTTP 403)
 pydub>=0.25.1                      # Conversion (mono 16 kHz) and audio chunking via FFmpeg
 audioop-lts>=0.2.2; python_version >= "3.13"  # pydub needs `audioop`, removed from Python 3.13+ (e.g. Streamlit Cloud's 3.14)
 

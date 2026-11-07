@@ -131,6 +131,35 @@ def fetch_youtube_info(url: str) -> dict:
     }
 
 
+# YouTube player clients tried, in order, when YouTube refuses a download with HTTP 403 — common on
+# cloud servers (e.g. Streamlit Community Cloud), where it blocks some clients for data-centre IPs.
+# ``None`` = yt-dlp's own default clients.
+YOUTUBE_FALLBACK_CLIENTS: tuple[str | None, ...] = (None, "tv_simply", "tv", "web_safari", "mweb", "android_vr")
+
+
+def _download_with_fallback(yt_dlp, url: str, ydl_opts: dict, output_dir: Path) -> tuple[dict, Path]:
+    """Download with yt-dlp's default clients; on HTTP 403 retry with other player clients."""
+    error: Exception | None = None
+    for client in YOUTUBE_FALLBACK_CLIENTS:
+        options = dict(ydl_opts)
+        if client:
+            options["extractor_args"] = {"youtube": {"player_client": [client]}}
+            for partial in output_dir.glob("*.part"):  # never continue another client's stream
+                partial.unlink(missing_ok=True)
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if client:
+                    logger.info("YouTube download succeeded with the %s client.", client)
+                return info, Path(ydl.prepare_filename(info))
+        except Exception as exc:
+            error = exc
+            if "403" not in str(exc):
+                raise  # not a refusal (e.g. private video, network down): retrying won't help
+            logger.warning("YouTube refused the download (HTTP 403) with client %s; trying the next.", client or "default")
+    raise error  # every client was refused
+
+
 def download_youtube_audio(url: str, output_dir: str | Path | None = None) -> str:
     """Download the best audio stream as-is (m4a/webm); conversion happens in convert_to_wav."""
     import yt_dlp
@@ -152,11 +181,15 @@ def download_youtube_audio(url: str, output_dir: str | Path | None = None) -> st
         "continuedl": True,  # resume a partially downloaded file after a failure
     }
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            downloaded = Path(ydl.prepare_filename(info))
+        info, downloaded = _download_with_fallback(yt_dlp, url, ydl_opts, output_dir)
     except Exception as exc:  # yt_dlp.utils.DownloadError and friends
         message = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))
+        if "403" in message:
+            message += (
+                ". YouTube refused the download. Check that Deno is installed (yt-dlp[default,deno] in "
+                "requirements.txt; see System status). If it is, YouTube may be blocking this server — "
+                "upload the audio or video file instead."
+            )
         raise AudioProcessingError(f"Could not download the YouTube audio: {message}") from exc
 
     if not downloaded.exists():

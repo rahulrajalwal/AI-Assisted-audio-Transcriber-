@@ -244,6 +244,7 @@ def list_checkpoints() -> list[dict[str, Any]]:
             "chunks_done": len(data.get("chunks") or {}),
             "chunks_total": len(chunk_plan),
             "transcribed": bool(data.get("transcript")),
+            "audio_saved": bool(data.get("source_file")) and Path(data["source_file"]).exists(),
             "updated_at": data.get("updated_at", ""),
         })
     return sorted(jobs, key=lambda job: job["updated_at"], reverse=True)

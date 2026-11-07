@@ -265,6 +265,16 @@ def sarvam_configured() -> bool:
 # ── Session state ───────────────────────────────────────────────────────────────
 
 
+def deno_available() -> bool:
+    """yt-dlp needs a JavaScript runtime (Deno) to solve YouTube's challenges; without it downloads fail (HTTP 403)."""
+    try:
+        from deno import find_deno_bin  # installed by yt-dlp[deno] (requirements.txt)
+
+        return bool(find_deno_bin())
+    except Exception:
+        return bool(shutil.which("deno"))
+
+
 def init_state() -> None:
     defaults = {
         "view": "home",  # "home" | "meeting"
@@ -408,6 +418,7 @@ def render_sidebar(meetings: list[MeetingRecord], busy: bool) -> None:
             ("LLM model", llm["model_available"], "available", "unavailable"),
             ("Sarvam API key", sarvam_configured(), "configured", "missing"),
             ("FFmpeg", bool(shutil.which("ffmpeg")), "found", "not found"),
+            ("Deno (YouTube downloads)", deno_available(), "found", "not found"),
         ]
         html_rows = "".join(
             f'<div class="status-row"><span>{name}</span>'
@@ -492,7 +503,7 @@ def checkpoint_progress(job: dict) -> str:
         return "transcript saved — AI analysis pending"
     if job.get("chunks_total"):
         return f"{job['chunks_done']} of {job['chunks_total']} audio parts transcribed"
-    return "audio saved" if job.get("status") else "started"
+    return "audio saved" if job.get("audio_saved") else "audio not downloaded yet"
 
 
 def queue_resume(meeting_id: str, label: str, language: str) -> None:
